@@ -94,13 +94,18 @@ gcc -o rant rant.c
 
 ## Limitations
 Features not implemented:
-* Specify test duration -d <duration> in the args (workaround: use timeout command)
-* Implement histogram with percentiles for the latencies
-* Add warm-up phase to discard initial packets (-w flag)
-* Clock drift warning: check clock drift
-* Debug mode (verbose mode to debug)
+* Timing 
+  * Specify test duration -d <duration> in the args (workaround: use timeout command)
+  * Add warm-up phase to discard initial packets (-w flag)
+* Check
+  * Clock drift warning: check clock drift
+  * Check hw timestamp support
+  * Supoort nic
+* Log level
+  * Debug mode (verbose mode to debug)
+  * -q quiet (no stdout at all)
 * Memory allocation: use hugepages as option
-* -q quiet (no stdout at all)
-* Check hw timestamp support
-* Only supoort mlx nic
-
+* Options
+  * -r <file> record transactions to a file
+  * -h generate histogram
+  * -o <ns> overflow bucket

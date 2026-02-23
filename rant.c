@@ -14,16 +14,39 @@
 #include <getopt.h>
 #include <sys/mman.h>
 #include <linux/mman.h>
+#include <inttypes.h>
+
+#define BUCKET_OVERFLOW_NS 100000ULL
+#define BUCKET_SIZE_NS     1000ULL
+#define BUCKET_MAX         ((long long)(BUCKET_OVERFLOW_NS / BUCKET_SIZE_NS) + 1)
+
+long long *histogram = NULL;
+long long bucket_overflow_ns, bucket_size_ns, bucket_max;
+
+size_t overflow_capacity = 500000000;
+uint64_t *overflow_samples = NULL;
 
 struct record {
     struct timespec hw_tx, hw_rx, sw_tx, sw_rx;
     long long delta;
 };
 
+struct Stats {
+    uint64_t min;
+    uint64_t max;
+    uint64_t sum;
+    uint64_t count;
+    uint64_t min_idx;
+    uint64_t max_idx;
+};
+
+struct Stats stats = { 0x7FFFFFFFFFFFFFFFLL, 0, 0, 0, 0, 0 };
+
 struct record *log_book = NULL;
 size_t log_size = 0;
 size_t log_capacity = 10000000000;
-volatile int keep_running = 1;
+volatile sig_atomic_t keep_running = 1;
+
 
 void handle_sig(int sig) {
     keep_running = 0;
@@ -34,6 +57,108 @@ void get_ts(struct msghdr *msg, struct timespec *ts) {
     for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg))
         if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING)
             *ts = ((struct timespec *)CMSG_DATA(cmsg))[2];
+}
+
+/* Record sample in the histogram */
+void histogram_record(long long delta) {
+    stats.count++;
+    if (delta < 0) delta = 0;
+    stats.sum += delta;
+    if (delta < stats.min) {
+        stats.min_idx = stats.count;
+	stats.min = delta;
+    }
+    if (delta > stats.max) {
+	stats.max_idx = stats.count;
+	stats.max = delta;
+    }
+    int bucket = (int) delta / bucket_size_ns;
+    if (bucket >= bucket_overflow_ns) {
+        overflow_samples[histogram[bucket_max]]=delta;
+	histogram[bucket_max]++;
+    }
+    else
+	histogram[bucket]++;
+    return;
+}
+
+int compare_samples(const void *a, const void *b) {
+    uint64_t arg1 = *(const uint64_t *)a;
+    uint64_t arg2 = *(const uint64_t *)b;
+    if (arg1 < arg2) return -1;
+    if (arg1 > arg2) return 1;
+    return 0;
+}
+
+/* Get Percentile */
+uint64_t get_percentile(long long *hist, double percentile) {
+    if (stats.count == 0) return 0;
+
+    /* Calculate the rank we are looking for */
+    double target = stats.count * percentile;
+    if (target == 0) return stats.min;
+
+    uint64_t running_sum = 0;
+    /* Find the bucket that crosses the target */
+    for (int i = 0; i <= bucket_overflow_ns; ++i) {
+        running_sum += hist[i];
+        if (running_sum >= target) {
+            /* Return the avg latency in the *middle* of this bucket */
+            return (uint64_t) ((i + 0.5) * bucket_size_ns / 1e3);
+        }
+    }
+
+    /* overflow bucket logic (target sample is in the overflow bucket) */
+    uint64_t index = target - running_sum - 1;
+    if (index < 0) index = 0;
+    if (index >= hist[bucket_max]) index = hist[bucket_max] - 1;
+    qsort(overflow_samples, hist[bucket_max], sizeof(uint64_t), compare_samples);
+    /* Return the exact value recorded from the overflow bucket */
+    return (uint64_t) overflow_samples[index] / 1e3;
+}
+
+void histogram_summary(long long *hist)
+{
+        int last_empty = 0;
+        if (stats.count == 0) {
+                return;
+        }
+
+        printf("Histogram Summary:\n");
+        printf("  Samples   :  %lu\n", stats.count);
+        printf("  Minimum   :  %.2f us (#%lu)\n",
+			(double) (stats.min / 1e3), stats.min_idx);
+        printf("  Maximum   :  %.2f us (#%lu)\n",
+			(double) (stats.max / 1e3), stats.max_idx);
+        printf("  Average   :  %.2f us\n",
+			(double) (stats.sum / stats.count) / 1e3);
+        printf("  Percentiles (us):\n");
+        printf("    50th    :  %lu (Median)\n", get_percentile(hist, 0.50));
+        printf("    90th    :  %lu\n", get_percentile(hist, 0.90));
+        printf("    95th    :  %lu\n", get_percentile(hist, 0.95));
+        printf("    99th    :  %lu\n", get_percentile(hist, 0.99));
+        printf("    99.9th  :  %lu\n", get_percentile(hist, 0.999));
+        printf("    99.99th :  %lu\n", get_percentile(hist, 0.9999));
+
+        printf("  Buckets (us):\n");
+        printf("    %lu-♾️ : %lu (overflows)\n",
+               (long long) (bucket_overflow_ns / 1e3), hist[bucket_max]);
+        printf("    ...\n");
+        for (int i = bucket_max-1; i >= 0; i--) {
+                if (hist[i] > 0) {
+                        uint32_t bucket_start = (uint32_t) i * bucket_size_ns / 1e3;
+                        uint32_t bucket_end = (uint32_t) (i + 1) * bucket_size_ns / 1e3;
+                        printf("    %lu-%lu: %lu\n",
+                                bucket_start, bucket_end, hist[i]);
+                        last_empty = 0;
+                }
+                else {
+                        if (last_empty == 0) {
+                                printf("    ...\n");
+                        }
+                        last_empty = 1;
+                }
+        }
 }
 
 /* Emit: dispatch round trip pkt (client) */
@@ -119,6 +244,8 @@ void emit(char* iface, char* ip, long long threshold, int use_sw_timestamps) {
             rtt->delta = 
 		    (rtt->hw_rx.tv_sec - rtt->hw_tx.tv_sec) * 1000000000LL +
                     (rtt->hw_rx.tv_nsec - rtt->hw_tx.tv_nsec);
+
+	    histogram_record(rtt->delta);
 
             if (threshold > 0 && rtt->delta > threshold) {
                 printf("Round-Trip latency (%lld ns) exceeds threshold (%lld ns).\n",
@@ -219,6 +346,8 @@ void reflect(char* iface, long long threshold, int use_sw_timestamps) {
 		    (resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
                     (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
 
+	    histogram_record(resp->delta);
+
             if (threshold > 0 && resp->delta > threshold) {
                 printf("Response latency (%lld ns) exceeds threshold (%lld ns).\n",
 			resp->delta, threshold);
@@ -233,15 +362,6 @@ void reflect(char* iface, long long threshold, int use_sw_timestamps) {
 
 
 void roundtrip_log() {    
-    /* Print Final Stats */
-    long long min = 1e18, max = 0, sum = 0;
-    for(int i=0; i<log_size; i++) {
-        if(log_book[i].delta < min) min = log_book[i].delta;
-        if(log_book[i].delta > max) max = log_book[i].delta;
-        sum += log_book[i].delta;
-    }
-    if (log_size == 0) min=0;
-
     FILE *fp = fopen("roundtrip.txt", "w");
     if (fp) {
         int len = fprintf(fp, "%10s %30s %30s %30s %30s %15s\n", "SEQ", "T1_SW", "T1_HW", "T4_HW", "T4_SW", "RTT");
@@ -261,24 +381,16 @@ void roundtrip_log() {
         }
     }
     fclose(fp);
-
-    printf("\n--- Round-Trip Latency Statistics ---\n");
-    printf("MIN: %lld ns | MAX: %lld ns | AVG: %lld ns | Total Samples: %lld \n\n", 
-            min, max, log_size ? sum/log_size : 0, log_size);
-
     return; 
 }
 
-void response_log() {    
-    /* Print Final Stats */
-    long long min = 1e18, max = 0, sum = 0;
-    for(int i=0; i<log_size; i++) {
-        if(log_book[i].delta < min) min = log_book[i].delta;
-        if(log_book[i].delta > max) max = log_book[i].delta;
-        sum += log_book[i].delta;
-    }
-    if (log_size == 0) min=0;
+void get_stats() {
+    printf("\n--- Latency Statistics ---\n");
+    printf("MIN: %"PRIu64" ns | MAX: %"PRIu64" ns | AVG: %"PRIu64" ns | Total Samples: %"PRIu64" \n\n", 
+            stats.min, stats.max, stats.count ? (uint64_t) stats.sum / stats.count : 0, stats.count);
+}
 
+void response_log() {
     FILE *fp = fopen("response.txt", "w");
     if (fp) {
         int len = fprintf(fp, "%10s %30s %30s %30s %30s %15s\n", "SEQ", "T2_HW", "T2_SW", "T3_SW", "T3_HW", "RESPONSE");
@@ -298,11 +410,6 @@ void response_log() {
         }
     }
     fclose(fp);
-
-    printf("\n--- Response Latency Statistics ---\n");
-    printf("MIN: %lld ns | MAX: %lld ns | AVG: %lld ns | Total Samples: %lld \n\n", 
-            min, max, log_size ? sum/log_size : 0, log_size);
-
     return; 
 }
 
@@ -315,6 +422,10 @@ int main(int argc, char **argv) {
     char *ip = NULL;
 
     signal(SIGINT, handle_sig);
+
+    bucket_overflow_ns = BUCKET_OVERFLOW_NS;
+    bucket_size_ns = BUCKET_SIZE_NS;
+    bucket_max = BUCKET_MAX;
 
     while ((opt = getopt(argc, argv, "i:a:t:s")) != -1) {
         switch (opt) {
@@ -345,8 +456,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    size_t total_bytes = sizeof(struct record) * log_capacity;
-    log_book = malloc(total_bytes);
+    log_book = calloc(log_capacity, sizeof(struct record));
+    if (log_book == NULL) return 1;
+
+    /* [0-bucket_max-1]: buckets, [bucket_max]: overflows */
+    histogram = calloc(bucket_max+1, sizeof(uint64_t));
+    if (histogram == NULL) return 1;
+
+    overflow_samples = calloc(overflow_capacity, sizeof(uint64_t));
+    if (overflow_samples == NULL) return 1;
 
     /* Reflect (server) */
     if (ip == NULL) {
@@ -358,8 +476,12 @@ int main(int argc, char **argv) {
         emit(iface, ip, threshold, use_sw_timestamps);
 	roundtrip_log();
     }
+    get_stats();
+    histogram_summary(histogram);
 
     free(log_book);
+    free(histogram);
+    free(overflow_samples);
 
     return 0;
 }
