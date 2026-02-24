@@ -20,15 +20,24 @@
 #define BUCKET_SIZE_NS     1000ULL
 #define BUCKET_MAX         ((long long)(BUCKET_OVERFLOW_NS / BUCKET_SIZE_NS) + 1)
 
-long long *histogram = NULL;
-long long bucket_overflow_ns, bucket_size_ns, bucket_max;
+typedef struct {
+    const char *iface;
+    const char *ip;
+    uint64_t threshold;
+    int use_sw_timestamps;
+    int show_histogram;
+    int write_log;
+} config_t;
+
+uint64_t *histogram = NULL;
+uint64_t bucket_overflow_ns, bucket_size_ns, bucket_max;
 
 size_t overflow_capacity = 500000000;
 uint64_t *overflow_samples = NULL;
 
 struct record {
     struct timespec hw_tx, hw_rx, sw_tx, sw_rx;
-    long long delta;
+    uint64_t delta;
 };
 
 struct Stats {
@@ -46,7 +55,6 @@ struct record *log_book = NULL;
 size_t log_size = 0;
 size_t log_capacity = 10000000000;
 volatile sig_atomic_t keep_running = 1;
-
 
 void handle_sig(int sig) {
     keep_running = 0;
@@ -91,7 +99,7 @@ int compare_samples(const void *a, const void *b) {
 }
 
 /* Get Percentile */
-uint64_t get_percentile(long long *hist, double percentile) {
+uint64_t get_percentile(double percentile) {
     if (stats.count == 0) return 0;
 
     /* Calculate the rank we are looking for */
@@ -101,7 +109,7 @@ uint64_t get_percentile(long long *hist, double percentile) {
     uint64_t running_sum = 0;
     /* Find the bucket that crosses the target */
     for (int i = 0; i <= bucket_overflow_ns; ++i) {
-        running_sum += hist[i];
+        running_sum += histogram[i];
         if (running_sum >= target) {
             /* Return the avg latency in the *middle* of this bucket */
             return (uint64_t) ((i + 0.5) * bucket_size_ns / 1e3);
@@ -111,13 +119,13 @@ uint64_t get_percentile(long long *hist, double percentile) {
     /* overflow bucket logic (target sample is in the overflow bucket) */
     uint64_t index = target - running_sum - 1;
     if (index < 0) index = 0;
-    if (index >= hist[bucket_max]) index = hist[bucket_max] - 1;
-    qsort(overflow_samples, hist[bucket_max], sizeof(uint64_t), compare_samples);
+    if (index >= histogram[bucket_max]) index = histogram[bucket_max] - 1;
+    qsort(overflow_samples, histogram[bucket_max], sizeof(uint64_t), compare_samples);
     /* Return the exact value recorded from the overflow bucket */
     return (uint64_t) overflow_samples[index] / 1e3;
 }
 
-void histogram_summary(long long *hist)
+void histogram_summary()
 {
         int last_empty = 0;
         if (stats.count == 0) {
@@ -133,23 +141,23 @@ void histogram_summary(long long *hist)
         printf("  Average   :  %.2f us\n",
 			(double) (stats.sum / stats.count) / 1e3);
         printf("  Percentiles (us):\n");
-        printf("    50th    :  %lu (Median)\n", get_percentile(hist, 0.50));
-        printf("    90th    :  %lu\n", get_percentile(hist, 0.90));
-        printf("    95th    :  %lu\n", get_percentile(hist, 0.95));
-        printf("    99th    :  %lu\n", get_percentile(hist, 0.99));
-        printf("    99.9th  :  %lu\n", get_percentile(hist, 0.999));
-        printf("    99.99th :  %lu\n", get_percentile(hist, 0.9999));
+        printf("    50th    :  %lu (Median)\n", get_percentile(0.50));
+        printf("    90th    :  %lu\n", get_percentile(0.90));
+        printf("    95th    :  %lu\n", get_percentile(0.95));
+        printf("    99th    :  %lu\n", get_percentile(0.99));
+        printf("    99.9th  :  %lu\n", get_percentile(0.999));
+        printf("    99.99th :  %lu\n", get_percentile(0.9999));
 
         printf("  Buckets (us):\n");
         printf("    %lu-♾️ : %lu (overflows)\n",
-               (long long) (bucket_overflow_ns / 1e3), hist[bucket_max]);
+               (long long) (bucket_overflow_ns / 1e3), histogram[bucket_max]);
         printf("    ...\n");
         for (int i = bucket_max-1; i >= 0; i--) {
-                if (hist[i] > 0) {
+                if (histogram[i] > 0) {
                         uint32_t bucket_start = (uint32_t) i * bucket_size_ns / 1e3;
                         uint32_t bucket_end = (uint32_t) (i + 1) * bucket_size_ns / 1e3;
                         printf("    %lu-%lu: %lu\n",
-                                bucket_start, bucket_end, hist[i]);
+                                bucket_start, bucket_end, histogram[i]);
                         last_empty = 0;
                 }
                 else {
@@ -162,20 +170,20 @@ void histogram_summary(long long *hist)
 }
 
 /* Emit: dispatch round trip pkt (client) */
-void emit(char* iface, char* ip, long long threshold, int use_sw_timestamps) {
+void emit(config_t cfg) {
 
     /* Socket options including Hardware Timestamping */
     int s = socket(AF_INET, SOCK_DGRAM, 0);
-    struct ifreq ifr; strncpy(ifr.ifr_name, iface, IFNAMSIZ);
-    struct hwtstamp_config cfg = { .tx_type = HWTSTAMP_TX_ON, .rx_filter = HWTSTAMP_FILTER_ALL };
-    ifr.ifr_data = (char *)&cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
+    struct ifreq ifr; strncpy(ifr.ifr_name, cfg.iface, IFNAMSIZ);
+    struct hwtstamp_config hw_cfg = { .tx_type = HWTSTAMP_TX_ON, .rx_filter = HWTSTAMP_FILTER_ALL };
+    ifr.ifr_data = (char *)&hw_cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
 
     int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
     setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
 
     /* Socket addr & port */
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(12345) };
-    inet_pton(AF_INET, ip, &addr.sin_addr);
+    inet_pton(AF_INET, cfg.ip, &addr.sin_addr);
 
     /* RX */
     char buf_rx[1];
@@ -210,7 +218,7 @@ void emit(char* iface, char* ip, long long threshold, int use_sw_timestamps) {
         rtt->hw_tx.tv_nsec = 0;
 
 	/* T1_SW: Software timestamp when ping is sent */
-	if (use_sw_timestamps)
+	if (cfg.use_sw_timestamps)
 	    clock_gettime(CLOCK_TAI, &rtt->sw_tx);
 
 	/* Send Ping */
@@ -234,7 +242,7 @@ void emit(char* iface, char* ip, long long threshold, int use_sw_timestamps) {
         if (recvmsg(s, &msg_rx, 0) > 0) {
 
             /* T4_SW: Software timestamp when pong is received */
-            if (use_sw_timestamps)
+            if (cfg.use_sw_timestamps)
 		clock_gettime(CLOCK_TAI, &rtt->sw_rx);
 
             /* T4_HW: Hardware timestamp when pong is received  */
@@ -247,9 +255,9 @@ void emit(char* iface, char* ip, long long threshold, int use_sw_timestamps) {
 
 	    histogram_record(rtt->delta);
 
-            if (threshold > 0 && rtt->delta > threshold) {
-                printf("Round-Trip latency (%lld ns) exceeds threshold (%lld ns).\n",
-			rtt->delta, threshold);
+            if (cfg.threshold > 0 && rtt->delta > cfg.threshold) {
+                printf("Round-Trip latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
+			rtt->delta, cfg.threshold);
                 break;
             }
         }
@@ -259,13 +267,13 @@ void emit(char* iface, char* ip, long long threshold, int use_sw_timestamps) {
 }
 
 /* Reflect: send back round trip pkt (server) */
-void reflect(char* iface, long long threshold, int use_sw_timestamps) {
+void reflect(config_t cfg) {
 
     /* Socket options including Hardware Timestamping */
     int s = socket(AF_INET, SOCK_DGRAM, 0);
-    struct ifreq ifr; strncpy(ifr.ifr_name, iface, IFNAMSIZ);
-    struct hwtstamp_config cfg = { .tx_type = HWTSTAMP_TX_ON, .rx_filter = HWTSTAMP_FILTER_ALL };
-    ifr.ifr_data = (char *)&cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
+    struct ifreq ifr; strncpy(ifr.ifr_name, cfg.iface, IFNAMSIZ);
+    struct hwtstamp_config hw_cfg = { .tx_type = HWTSTAMP_TX_ON, .rx_filter = HWTSTAMP_FILTER_ALL };
+    ifr.ifr_data = (char *)&hw_cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
 
     int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
     setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
@@ -312,7 +320,7 @@ void reflect(char* iface, long long threshold, int use_sw_timestamps) {
         
 	    struct record *resp = &log_book[log_size++];
 
-            if (use_sw_timestamps) {
+            if (cfg.use_sw_timestamps) {
 	        /* T2_SW: Software timestamp when ping is received */
 	        clock_gettime(CLOCK_TAI, &resp->sw_rx);
             }
@@ -328,7 +336,7 @@ void reflect(char* iface, long long threshold, int use_sw_timestamps) {
             resp->hw_tx.tv_nsec = 0;
 
             /* T3_SW: Software timestamp when pong is sent */
-            if (use_sw_timestamps) {
+            if (cfg.use_sw_timestamps) {
                 clock_gettime(CLOCK_TAI, &resp->sw_tx);
             }
 
@@ -348,9 +356,9 @@ void reflect(char* iface, long long threshold, int use_sw_timestamps) {
 
 	    histogram_record(resp->delta);
 
-            if (threshold > 0 && resp->delta > threshold) {
-                printf("Response latency (%lld ns) exceeds threshold (%lld ns).\n",
-			resp->delta, threshold);
+            if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
+                printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
+			resp->delta, cfg.threshold);
 		keep_running = 0;
                 break;
             }
@@ -384,7 +392,7 @@ void roundtrip_log() {
     return; 
 }
 
-void get_stats() {
+void show_stats() {
     printf("\n--- Latency Statistics ---\n");
     printf("MIN: %"PRIu64" ns | MAX: %"PRIu64" ns | AVG: %"PRIu64" ns | Total Samples: %"PRIu64" \n\n", 
             stats.min, stats.max, stats.count ? (uint64_t) stats.sum / stats.count : 0, stats.count);
@@ -410,16 +418,18 @@ void response_log() {
         }
     }
     fclose(fp);
-    return; 
 }
 
 int main(int argc, char **argv) {
-    long long threshold = 0;
-    int use_sw_timestamps = 0;
     int opt;
-
-    char *iface = NULL;
-    char *ip = NULL;
+    config_t config = {
+        .iface = NULL,
+        .ip = NULL,
+        .threshold = 0,
+        .use_sw_timestamps = 0,
+	.show_histogram = 0,
+	.write_log = 0
+    };
 
     signal(SIGINT, handle_sig);
 
@@ -427,30 +437,36 @@ int main(int argc, char **argv) {
     bucket_size_ns = BUCKET_SIZE_NS;
     bucket_max = BUCKET_MAX;
 
-    while ((opt = getopt(argc, argv, "i:a:t:s")) != -1) {
+    while ((opt = getopt(argc, argv, "i:a:t:sHl")) != -1) {
         switch (opt) {
             case 'i':
-                iface = optarg;
+                config.iface = optarg;
                 break;
             case 'a':
-                ip = optarg;
+                config.ip = optarg;
                 break;
             case 't':
-                threshold = atoll(optarg);
-                if (threshold <= 0) {
+                config.threshold = atoll(optarg);
+                if (config.threshold <= 0) {
                     fprintf(stderr, "Error: Threshold must be > 0\n");
                     return 1;
                 }
                 break;
             case 's':
-                use_sw_timestamps = 1;
+                config.use_sw_timestamps = 1;
                 break;
+	    case 'H':
+		config.show_histogram = 1;
+		break;
+	    case 'l':
+		config.write_log = 1;
+		break;
             default:
                 goto usage;
         }
     }
 
-    if (iface == NULL) {
+    if (config.iface == NULL) {
     usage:
         printf("Usage: %s -i <iface> [-a <ip>] [-t <threshold_ns>] [-s]\n", argv[0]);
         return 1;
@@ -467,17 +483,20 @@ int main(int argc, char **argv) {
     if (overflow_samples == NULL) return 1;
 
     /* Reflect (server) */
-    if (ip == NULL) {
-        reflect(iface, threshold, use_sw_timestamps);
-	response_log();
+    if (config.ip == NULL) {
+        reflect(config);
+	if (config.write_log)
+	    response_log();
     }
     /* Emit (client) */
     else {
-        emit(iface, ip, threshold, use_sw_timestamps);
-	roundtrip_log();
+        emit(config);
+	if (config.write_log)
+	    roundtrip_log();
     }
-    get_stats();
-    histogram_summary(histogram);
+    show_stats();
+    if (config.show_histogram)
+	histogram_summary();
 
     free(log_book);
     free(histogram);
