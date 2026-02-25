@@ -16,9 +16,9 @@
 #include <linux/mman.h>
 #include <inttypes.h>
 
-#define BUCKET_OVERFLOW_NS 100000ULL
-#define BUCKET_SIZE_NS     1000ULL
-#define BUCKET_MAX         ((long long)(BUCKET_OVERFLOW_NS / BUCKET_SIZE_NS) + 1)
+#define DEFAULT_BUCKET_OVERFLOW_NS 100000ULL
+#define DEFAULT_BUCKET_SIZE_NS     1000ULL
+#define DEFAULT_BUCKET_MAX         ((uint64_t)(DEFAULT_BUCKET_OVERFLOW_NS / DEFAULT_BUCKET_SIZE_NS) + 1)
 
 typedef struct {
     const char *iface;
@@ -27,10 +27,14 @@ typedef struct {
     int use_sw_timestamps;
     int show_histogram;
     int write_log;
+    uint64_t bucket_overflow;
+    uint32_t bucket_size;
+    uint64_t duration;
+    uint64_t warmup;
 } config_t;
 
 uint64_t *histogram = NULL;
-uint64_t bucket_overflow_ns, bucket_size_ns, bucket_max;
+uint64_t bucket_max;
 
 size_t overflow_capacity = 500000000;
 uint64_t *overflow_samples = NULL;
@@ -67,8 +71,25 @@ void get_ts(struct msghdr *msg, struct timespec *ts) {
             *ts = ((struct timespec *)CMSG_DATA(cmsg))[2];
 }
 
+static inline uint64_t rdtsc(void) {
+    uint32_t lo, hi;
+    // __builtin_ia32_rdtsc() is a compiler intrinsic for 'rdtsc'
+    __asm__ __volatile__ ("rdtsc" : "=a" (lo), "=d" (hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+uint64_t calibrate_rdtsc() {
+    /* one sec */
+    struct timespec sleep_time = {1, 0};
+    uint64_t start = rdtsc();
+    nanosleep(&sleep_time, NULL);
+    uint64_t end = rdtsc();
+    /* Cycles Per Second */
+    return end - start;
+}
+
 /* Record sample in the histogram */
-void histogram_record(long long delta) {
+void histogram_record(long long delta, config_t cfg) {
     stats.count++;
     if (delta < 0) delta = 0;
     stats.sum += delta;
@@ -80,14 +101,12 @@ void histogram_record(long long delta) {
 	stats.max_idx = stats.count;
 	stats.max = delta;
     }
-    int bucket = (int) delta / bucket_size_ns;
-    if (bucket >= bucket_overflow_ns) {
-        overflow_samples[histogram[bucket_max]]=delta;
-	histogram[bucket_max]++;
+    uint32_t bucket_index = (uint32_t) delta / cfg.bucket_size;
+    if (bucket_index >= cfg.bucket_overflow) {
+	bucket_index = bucket_max;
+        overflow_samples[histogram[bucket_index]]=delta;
     }
-    else
-	histogram[bucket]++;
-    return;
+    histogram[bucket_index]++;
 }
 
 int compare_samples(const void *a, const void *b) {
@@ -99,7 +118,7 @@ int compare_samples(const void *a, const void *b) {
 }
 
 /* Get Percentile */
-uint64_t get_percentile(double percentile) {
+uint64_t get_percentile(double percentile, config_t cfg) {
     if (stats.count == 0) return 0;
 
     /* Calculate the rank we are looking for */
@@ -108,11 +127,11 @@ uint64_t get_percentile(double percentile) {
 
     uint64_t running_sum = 0;
     /* Find the bucket that crosses the target */
-    for (int i = 0; i <= bucket_overflow_ns; ++i) {
+    for (int i = 0; i <= cfg.bucket_overflow; ++i) {
         running_sum += histogram[i];
         if (running_sum >= target) {
             /* Return the avg latency in the *middle* of this bucket */
-            return (uint64_t) ((i + 0.5) * bucket_size_ns / 1e3);
+            return (uint64_t) ((i + 0.5) * cfg.bucket_size / 1e3);
         }
     }
 
@@ -125,7 +144,7 @@ uint64_t get_percentile(double percentile) {
     return (uint64_t) overflow_samples[index] / 1e3;
 }
 
-void histogram_summary()
+void histogram_summary(config_t cfg)
 {
         int last_empty = 0;
         if (stats.count == 0) {
@@ -141,21 +160,21 @@ void histogram_summary()
         printf("  Average   :  %.2f us\n",
 			(double) (stats.sum / stats.count) / 1e3);
         printf("  Percentiles (us):\n");
-        printf("    50th    :  %lu (Median)\n", get_percentile(0.50));
-        printf("    90th    :  %lu\n", get_percentile(0.90));
-        printf("    95th    :  %lu\n", get_percentile(0.95));
-        printf("    99th    :  %lu\n", get_percentile(0.99));
-        printf("    99.9th  :  %lu\n", get_percentile(0.999));
-        printf("    99.99th :  %lu\n", get_percentile(0.9999));
+        printf("    50th    :  %lu (Median)\n", get_percentile(0.50, cfg));
+        printf("    90th    :  %lu\n", get_percentile(0.90, cfg));
+        printf("    95th    :  %lu\n", get_percentile(0.95, cfg));
+        printf("    99th    :  %lu\n", get_percentile(0.99, cfg));
+        printf("    99.9th  :  %lu\n", get_percentile(0.999, cfg));
+        printf("    99.99th :  %lu\n", get_percentile(0.9999, cfg));
 
         printf("  Buckets (us):\n");
         printf("    %lu-♾️ : %lu (overflows)\n",
-               (long long) (bucket_overflow_ns / 1e3), histogram[bucket_max]);
+               (long long) (cfg.bucket_overflow / 1e3), histogram[bucket_max]);
         printf("    ...\n");
         for (int i = bucket_max-1; i >= 0; i--) {
                 if (histogram[i] > 0) {
-                        uint32_t bucket_start = (uint32_t) i * bucket_size_ns / 1e3;
-                        uint32_t bucket_end = (uint32_t) (i + 1) * bucket_size_ns / 1e3;
+                        uint32_t bucket_start = (uint32_t) i * cfg.bucket_size / 1e3;
+                        uint32_t bucket_end = (uint32_t) (i + 1) * cfg.bucket_size / 1e3;
                         printf("    %lu-%lu: %lu\n",
                                 bucket_start, bucket_end, histogram[i]);
                         last_empty = 0;
@@ -205,8 +224,20 @@ void emit(config_t cfg) {
     msg_tx.msg_iov = &iov_tx; msg_tx.msg_iovlen = 1;
     msg_tx.msg_control = cbuf_tx;
 
+
+    uint64_t cycles_per_sec = calibrate_rdtsc();
+    uint64_t start_tsc = rdtsc();
+    uint64_t test_start_tsc = start_tsc;
+    uint64_t deadline = cfg.duration > 0 ? start_tsc + (cfg.duration * cycles_per_sec): 0;
+    uint64_t packet_count = 0;
+
     while (keep_running) {
-	
+
+	uint64_t now = rdtsc();
+
+	if (cfg.duration > 0 && now >= deadline)
+	    break;
+
         struct record *rtt = &log_book[log_size++];
 
         /* Reset length before fetching from Error Queue */
@@ -249,11 +280,16 @@ void emit(config_t cfg) {
             get_ts(&msg_rx, &rtt->hw_rx);
 
             /* Calculate Round Trip Time latency: T4_HW - T1_HW */
-            rtt->delta = 
+            rtt->delta =
 		    (rtt->hw_rx.tv_sec - rtt->hw_tx.tv_sec) * 1000000000LL +
                     (rtt->hw_rx.tv_nsec - rtt->hw_tx.tv_nsec);
 
-	    histogram_record(rtt->delta);
+            packet_count++;
+            if (packet_count > cfg.warmup) {
+	        histogram_record(rtt->delta, cfg);
+		if (packet_count == cfg.warmup + 1)
+		    test_start_tsc = rdtsc();
+	    }
 
             if (cfg.threshold > 0 && rtt->delta > cfg.threshold) {
                 printf("Round-Trip latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
@@ -263,7 +299,8 @@ void emit(config_t cfg) {
         }
     }
 
-    printf("Test is complete.\n");
+    uint64_t duration_cycles = rdtsc() - test_start_tsc;
+    printf("Test is complete. Duration: %.2f s\n", (double)duration_cycles / cycles_per_sec);
 }
 
 /* Reflect: send back round trip pkt (server) */
@@ -305,10 +342,21 @@ void reflect(config_t cfg) {
     msg_tx.msg_iov = &iov_tx; msg_tx.msg_iovlen = 1;
     msg_tx.msg_control = cbuf_tx;
 
+    uint64_t cycles_per_sec = calibrate_rdtsc();
+    uint64_t start_tsc = rdtsc();
+    uint64_t test_start_tsc = start_tsc;
+    uint64_t deadline = cfg.duration > 0 ? start_tsc + (cfg.duration * cycles_per_sec): 0;
+    uint64_t packet_count = 0;
+
     while (keep_running) {
-	
+
+        uint64_t now = rdtsc();
+
+        if (cfg.duration > 0 && now >= deadline)
+            break;
+
         /* Reset length before fetching Ping pkt */
-    	msg_rx.msg_controllen = sizeof(cbuf_rx); 
+    	msg_rx.msg_controllen = sizeof(cbuf_rx);
         msg_rx.msg_flags = 0;
 
 	/* Wait for Ping */
@@ -317,7 +365,7 @@ void reflect(config_t cfg) {
 
         /* Packet arrived: Receive Ping & Get RX Timestamp */
         if (recvmsg(s, &msg_rx, 0) > 0) {
-        
+
 	    struct record *resp = &log_book[log_size++];
 
             if (cfg.use_sw_timestamps) {
@@ -350,11 +398,16 @@ void reflect(config_t cfg) {
             }
 
 	    /* Calculate Response latency (T3_HW - T2_HW) */
-            resp->delta = 
+            resp->delta =
 		    (resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
                     (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
 
-	    histogram_record(resp->delta);
+            packet_count++;
+            if (packet_count > cfg.warmup) {
+	        histogram_record(resp->delta, cfg);
+		if (packet_count == cfg.warmup + 1)
+		    test_start_tsc = rdtsc();
+	    }
 
             if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
                 printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
@@ -365,7 +418,8 @@ void reflect(config_t cfg) {
         }
     }
 
-    printf("Test is complete.\n");
+    uint64_t duration_cycles = rdtsc() - test_start_tsc;
+    printf("Test is complete. Duration: %.2f s\n", (double)duration_cycles / cycles_per_sec);
 }
 
 
@@ -428,17 +482,61 @@ int main(int argc, char **argv) {
         .threshold = 0,
         .use_sw_timestamps = 0,
 	.show_histogram = 0,
-	.write_log = 0
+	.write_log = 0,
+	.bucket_overflow = DEFAULT_BUCKET_OVERFLOW_NS,
+        .bucket_size = DEFAULT_BUCKET_SIZE_NS,
+	.duration =0,
+	.warmup = 0
     };
+    
+    bucket_max = DEFAULT_BUCKET_MAX;
 
     signal(SIGINT, handle_sig);
 
-    bucket_overflow_ns = BUCKET_OVERFLOW_NS;
-    bucket_size_ns = BUCKET_SIZE_NS;
-    bucket_max = BUCKET_MAX;
-
-    while ((opt = getopt(argc, argv, "i:a:t:sHl")) != -1) {
+    while ((opt = getopt(argc, argv, "d:w:o:b:i:a:t:sHlh")) != -1) {
         switch (opt) {
+	    case 'd':
+		uint64_t duration_sec = atoll(optarg);
+		if (duration_sec <= 0) {
+                    fprintf(stdout, "Warning: Duration (%"PRIu64" sec) <= 0: "
+		                    "fallback to default.\n", duration_sec);
+		}
+		else {
+		    config.duration = duration_sec;
+		}
+		break;
+	    case 'w':
+		uint64_t warmup_pkts = atoll(optarg);
+		if (warmup_pkts <= 0) {
+                    fprintf(stdout, "Warning: Warmup (%"PRIu64" pkts) <= 0: "
+		                    "fallback to default.\n", warmup_pkts);
+		}
+		else {
+		    config.warmup = warmup_pkts;
+		}
+		break;
+	    case 'o':
+		uint64_t overflow_us = atoll(optarg);
+		if (overflow_us <= 0) {
+                    fprintf(stdout, "Warning: Bucket overflow (us) <= 0: "
+		                    "fallback to default.\n");
+		}
+		else {
+		    config.bucket_overflow = overflow_us * 1000;
+                    bucket_max = (uint64_t) config.bucket_overflow / config.bucket_size;
+		}
+		break;
+	    case 'b':
+		uint64_t size_us = atoll(optarg);
+		if (size_us <= 0) {
+                    fprintf(stdout, "Warning: Bucket size (us) <= 0: "
+		                    "fallback to default.\n");
+		}
+		else {
+		    config.bucket_size = size_us * 1000;
+                    bucket_max = (uint64_t) config.bucket_overflow / config.bucket_size;
+		}
+		break;
             case 'i':
                 config.iface = optarg;
                 break;
@@ -446,11 +544,13 @@ int main(int argc, char **argv) {
                 config.ip = optarg;
                 break;
             case 't':
-                config.threshold = atoll(optarg);
-                if (config.threshold <= 0) {
-                    fprintf(stderr, "Error: Threshold must be > 0\n");
-                    return 1;
+                uint64_t threshold = atoll(optarg);
+                if (threshold <= 0) {
+                    fprintf(stdout, "Warning: Threshold (us) <= 0: "
+				    "fallback to default.\n");
                 }
+		/* Converto us to ns */
+		config.threshold = threshold * 1000; 
                 break;
             case 's':
                 config.use_sw_timestamps = 1;
@@ -461,6 +561,8 @@ int main(int argc, char **argv) {
 	    case 'l':
 		config.write_log = 1;
 		break;
+	    case 'h':
+		goto usage;
             default:
                 goto usage;
         }
@@ -496,7 +598,7 @@ int main(int argc, char **argv) {
     }
     show_stats();
     if (config.show_histogram)
-	histogram_summary();
+	histogram_summary(config);
 
     free(log_book);
     free(histogram);
