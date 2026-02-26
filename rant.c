@@ -474,6 +474,23 @@ void response_log() {
     fclose(fp);
 }
 
+void print_usage(const char *progname) {
+    printf("Usage: %s --interface <iface> [OPTIONS]\n\n", progname);
+    printf("Required:\n");
+    printf("  -i, --interface <iface>       Network interface to use\n\n");
+    printf("Optional:\n");
+    printf("  -a, --address <ip>            Server IP address (client mode)\n");
+    printf("  -t, --threshold <us>          Stop when latency exceeds threshold (microseconds)\n");
+    printf("  -d, --duration <sec>          Test duration in seconds\n");
+    printf("  -w, --warmup <pkts>           Number of warmup packets to discard\n");
+    printf("  -s, --sw-timestamps           Collect software timestamps\n");
+    printf("  -H, --histogram               Show histogram summary\n");
+    printf("  -l, --log                     Write transaction log to file\n");
+    printf("  -o, --overflow <us>           Histogram overflow bucket threshold (default: 100us)\n");
+    printf("  -b, --bucket-size <us>        Histogram bucket size (default: 1us)\n");
+    printf("  -h, --help                    Show this help message\n");
+}
+
 int main(int argc, char **argv) {
     int opt;
     config_t config = {
@@ -493,7 +510,23 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, handle_sig);
 
-    while ((opt = getopt(argc, argv, "d:w:o:b:i:a:t:sHlh")) != -1) {
+    static struct option long_options[] = {
+        {"duration",      required_argument, 0, 'd'},
+        {"warmup",        required_argument, 0, 'w'},
+        {"overflow",      required_argument, 0, 'o'},
+        {"bucket-size",   required_argument, 0, 'b'},
+        {"interface",     required_argument, 0, 'i'},
+        {"address",       required_argument, 0, 'a'},
+        {"threshold",     required_argument, 0, 't'},
+        {"sw-timestamps", no_argument,       0, 's'},
+        {"histogram",     no_argument,       0, 'H'},
+        {"log",           no_argument,       0, 'l'},
+        {"help",          no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    int option_index = 0;
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:sHlh", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -562,16 +595,17 @@ int main(int argc, char **argv) {
 		config.write_log = 1;
 		break;
 	    case 'h':
-		goto usage;
+		print_usage(argv[0]);
+		return 0;
             default:
-                goto usage;
+		print_usage(argv[0]);
+                return 1;
         }
     }
 
     if (config.iface == NULL) {
-    usage:
-        printf("Usage: %s -i <iface> [-a <ip>] [-t <threshold_ns>] [-s]\n", argv[0]);
-        return 1;
+	print_usage(argv[0]);
+	return 1;
     }
 
     log_book = calloc(log_capacity, sizeof(struct record));

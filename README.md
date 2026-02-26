@@ -44,16 +44,27 @@ Emit (client)              |                       |      Reflect (server)
 ## Run
 
 ```
-./rant -i <iface> [-a <ip_addr>] [-t <threshold>] [-s]
+./rant --interface <iface> [OPTIONS]
 
-    -a <ip_addr>   : Client mode (omit -a for running on server)
-    -t <threshold> : Test stops when latency exceeds threshold
-    -s             : Collect SW timestamps
+Required:
+    --interface <iface>       Network interface to use
+
+Optional:
+    --address <ip>            Server IP address (client mode, omit for server mode)
+    --threshold <us>          Stop when latency exceeds threshold (microseconds)
+    --duration <sec>          Test duration in seconds
+    --warmup <pkts>           Number of warmup packets to discard from statistics
+    --sw-timestamps           Collect software timestamps
+    --histogram               Show histogram summary
+    --log                     Write transaction log to file
+    --overflow <us>           Histogram overflow bucket threshold (default: 100us)
+    --bucket-size <us>        Histogram bucket size (default: 1us)
+    --help                    Show help message
 ```
 
 ### Reflect (Server)
 ```
-#  ip netns exec ns_ens7f1np1 taskset --cpu-list 61 chrt -f 2 ./rant -i ens7f1np1 -t 100000 -s
+#  ip netns exec ns_ens7f1np1 taskset --cpu-list 61 chrt -f 2 ./rant --interface ens7f1np1 --threshold 100000 --sw-timestamps
 Test is complete.
 
 --- Response Latency Statistics ---
@@ -71,7 +82,7 @@ A log file `response.txt` is created with all the transactions:
 
 ### Emit (Client)
 ```
-# ip netns exec ns_ens7f0np0 timeout -k 3s --signal=SIGINT 10s taskset -c 51 chrt -f 2  ./rant -i ens7f0np0 -a 192.168.1.11 -t 100000 -s
+# ip netns exec ns_ens7f0np0 timeout -k 3s --signal=SIGINT 10s taskset -c 51 chrt -f 2  ./rant --interface ens7f0np0 --address 192.168.1.11 --threshold 100000 --sw-timestamps
 Test is complete.
 
 --- Round-Trip Latency Statistics ---
