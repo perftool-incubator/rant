@@ -448,8 +448,8 @@ void roundtrip_log(const char *filename) {
 
 void show_stats() {
     printf("\n--- Latency Statistics ---\n");
-    printf("MIN: %"PRIu64" ns | MAX: %"PRIu64" ns | AVG: %"PRIu64" ns | Total Samples: %"PRIu64" \n\n", 
-            stats.min, stats.max, stats.count ? (uint64_t) stats.sum / stats.count : 0, stats.count);
+    printf("MIN: %"PRIu64" ns | MAX: %"PRIu64" ns | AVG: %"PRIu64" ns | Total Samples: %"PRIu64" \n\n",
+            stats.count ? stats.min : 0, stats.count ? stats.max : 0, stats.count ? (uint64_t) stats.sum / stats.count : 0, stats.count);
 }
 
 void response_log(const char *filename) {
