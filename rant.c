@@ -233,11 +233,6 @@ void emit(config_t cfg) {
 
     while (keep_running) {
 
-	uint64_t now = rdtsc();
-
-	if (cfg.duration > 0 && now >= deadline)
-	    break;
-
         struct record *rtt = &log_book[log_size++];
 
         /* Reset length before fetching from Error Queue */
@@ -297,6 +292,10 @@ void emit(config_t cfg) {
                 break;
             }
         }
+
+        /* Check duration at end of loop to ensure we exceed the specified duration */
+        if (cfg.duration > 0 && rdtsc() > deadline)
+            break;
     }
 
     uint64_t duration_cycles = rdtsc() - test_start_tsc;
@@ -349,11 +348,6 @@ void reflect(config_t cfg) {
     uint64_t packet_count = 0;
 
     while (keep_running) {
-
-        uint64_t now = rdtsc();
-
-        if (cfg.duration > 0 && now >= deadline)
-            break;
 
         /* Reset length before fetching Ping pkt */
     	msg_rx.msg_controllen = sizeof(cbuf_rx);
@@ -416,6 +410,10 @@ void reflect(config_t cfg) {
                 break;
             }
         }
+
+        /* Check duration at end of loop to ensure we exceed the specified duration */
+        if (cfg.duration > 0 && rdtsc() > deadline)
+            break;
     }
 
     uint64_t duration_cycles = rdtsc() - test_start_tsc;
