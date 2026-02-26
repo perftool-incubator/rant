@@ -16,6 +16,14 @@
 #include <linux/mman.h>
 #include <inttypes.h>
 
+#ifndef SO_PREFER_BUSY_POLL
+#define SO_PREFER_BUSY_POLL 69
+#endif
+
+#ifndef SO_BUSY_POLL_BUDGET
+#define SO_BUSY_POLL_BUDGET 70
+#endif
+
 #define DEFAULT_BUCKET_OVERFLOW_NS 100000ULL
 #define DEFAULT_BUCKET_SIZE_NS     1000ULL
 #define DEFAULT_BUCKET_MAX         ((uint64_t)(DEFAULT_BUCKET_OVERFLOW_NS / DEFAULT_BUCKET_SIZE_NS) + 1)
@@ -31,6 +39,8 @@ typedef struct {
     uint32_t bucket_size;
     uint64_t duration;
     uint64_t warmup;
+    int busy_poll_budget;
+    int prefer_busy_poll;
 } config_t;
 
 uint64_t *histogram = NULL;
@@ -200,6 +210,19 @@ void emit(config_t cfg) {
     int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
     setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
 
+    /* Set busy poll socket options if configured */
+    if (cfg.busy_poll_budget > 0) {
+        if (setsockopt(s, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &cfg.busy_poll_budget, sizeof(cfg.busy_poll_budget)) < 0) {
+            perror("setsockopt SO_BUSY_POLL_BUDGET");
+        }
+    }
+    if (cfg.prefer_busy_poll) {
+        int prefer = 1;
+        if (setsockopt(s, SOL_SOCKET, SO_PREFER_BUSY_POLL, &prefer, sizeof(prefer)) < 0) {
+            perror("setsockopt SO_PREFER_BUSY_POLL");
+        }
+    }
+
     /* Socket addr & port */
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(12345) };
     inet_pton(AF_INET, cfg.ip, &addr.sin_addr);
@@ -313,6 +336,19 @@ void reflect(config_t cfg) {
 
     int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
     setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
+
+    /* Set busy poll socket options if configured */
+    if (cfg.busy_poll_budget > 0) {
+        if (setsockopt(s, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &cfg.busy_poll_budget, sizeof(cfg.busy_poll_budget)) < 0) {
+            perror("setsockopt SO_BUSY_POLL_BUDGET");
+        }
+    }
+    if (cfg.prefer_busy_poll) {
+        int prefer = 1;
+        if (setsockopt(s, SOL_SOCKET, SO_PREFER_BUSY_POLL, &prefer, sizeof(prefer)) < 0) {
+            perror("setsockopt SO_PREFER_BUSY_POLL");
+        }
+    }
 
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(12345), .sin_addr.s_addr = INADDR_ANY };
     bind(s, (struct sockaddr *)&addr, sizeof(addr));
@@ -486,6 +522,8 @@ void print_usage(const char *progname) {
     printf("  -l, --log <file>              Write transaction log to file\n");
     printf("  -o, --overflow <us>           Histogram overflow bucket threshold (default: 100us)\n");
     printf("  -b, --bucket-size <us>        Histogram bucket size (default: 1us)\n");
+    printf("  -B, --budget <budget>         Set SO_BUSY_POLL_BUDGET (NAPI poll budget)\n");
+    printf("  -P, --prefer-busypoll         Set SO_PREFER_BUSY_POLL (prefer busy poll over interrupt)\n");
     printf("  -h, --help                    Show this help message\n");
 }
 
@@ -501,7 +539,9 @@ int main(int argc, char **argv) {
 	.bucket_overflow = DEFAULT_BUCKET_OVERFLOW_NS,
         .bucket_size = DEFAULT_BUCKET_SIZE_NS,
 	.duration =0,
-	.warmup = 0
+	.warmup = 0,
+	.busy_poll_budget = 0,
+	.prefer_busy_poll = 0
     };
     
     bucket_max = DEFAULT_BUCKET_MAX;
@@ -509,22 +549,24 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_sig);
 
     static struct option long_options[] = {
-        {"duration",      required_argument, 0, 'd'},
-        {"warmup",        required_argument, 0, 'w'},
-        {"overflow",      required_argument, 0, 'o'},
-        {"bucket-size",   required_argument, 0, 'b'},
-        {"interface",     required_argument, 0, 'i'},
-        {"address",       required_argument, 0, 'a'},
-        {"threshold",     required_argument, 0, 't'},
-        {"sw-timestamps", no_argument,       0, 's'},
-        {"histogram",     no_argument,       0, 'H'},
-        {"log",           required_argument, 0, 'l'},
-        {"help",          no_argument,       0, 'h'},
+        {"duration",         required_argument, 0, 'd'},
+        {"warmup",           required_argument, 0, 'w'},
+        {"overflow",         required_argument, 0, 'o'},
+        {"bucket-size",      required_argument, 0, 'b'},
+        {"interface",        required_argument, 0, 'i'},
+        {"address",          required_argument, 0, 'a'},
+        {"threshold",        required_argument, 0, 't'},
+        {"sw-timestamps",    no_argument,       0, 's'},
+        {"histogram",        no_argument,       0, 'H'},
+        {"log",              required_argument, 0, 'l'},
+        {"budget",           required_argument, 0, 'B'},
+        {"prefer-busypoll",  no_argument,       0, 'P'},
+        {"help",             no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:sHl:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:sHl:B:Ph", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -591,6 +633,16 @@ int main(int argc, char **argv) {
 		break;
 	    case 'l':
 		config.log_file = optarg;
+		break;
+	    case 'B':  // --budget
+		config.busy_poll_budget = atoi(optarg);
+		if (config.busy_poll_budget <= 0) {
+		    fprintf(stdout, "Warning: Budget must be > 0, ignoring.\n");
+		    config.busy_poll_budget = 0;
+		}
+		break;
+	    case 'P':  // --prefer-busypoll
+		config.prefer_busy_poll = 1;
 		break;
 	    case 'h':
 		print_usage(argv[0]);
