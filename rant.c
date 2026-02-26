@@ -261,7 +261,7 @@ void emit(config_t cfg) {
         msg_rx.msg_flags = 0;
 
 	/* wait for pong */
-        while ((poll(&pfd_rx, 1, 100) <= 0) && (keep_running ))
+        while ((poll(&pfd_rx, 1, 0) <= 0) && (keep_running ))
             continue;		
 	
         /* Packet arrived: Receive Pong & Get RX Timestamp */
@@ -354,7 +354,7 @@ void reflect(config_t cfg) {
         msg_rx.msg_flags = 0;
 
 	/* Wait for Ping */
-        if (poll(&pfd_rx, 1, 100) <= 0)
+        if (poll(&pfd_rx, 1, 0) <= 0)
 	    continue;
 
         /* Packet arrived: Receive Ping & Get RX Timestamp */
