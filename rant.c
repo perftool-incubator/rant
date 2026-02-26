@@ -26,7 +26,7 @@ typedef struct {
     uint64_t threshold;
     int use_sw_timestamps;
     int show_histogram;
-    int write_log;
+    const char *log_file;
     uint64_t bucket_overflow;
     uint32_t bucket_size;
     uint64_t duration;
@@ -423,8 +423,8 @@ void reflect(config_t cfg) {
 }
 
 
-void roundtrip_log() {    
-    FILE *fp = fopen("roundtrip.txt", "w");
+void roundtrip_log(const char *filename) {
+    FILE *fp = fopen(filename, "w");
     if (fp) {
         int len = fprintf(fp, "%10s %30s %30s %30s %30s %15s\n", "SEQ", "T1_SW", "T1_HW", "T4_HW", "T4_SW", "RTT");
 	for (int i = 0; i < len - 1; i++) {
@@ -452,8 +452,8 @@ void show_stats() {
             stats.min, stats.max, stats.count ? (uint64_t) stats.sum / stats.count : 0, stats.count);
 }
 
-void response_log() {
-    FILE *fp = fopen("response.txt", "w");
+void response_log(const char *filename) {
+    FILE *fp = fopen(filename, "w");
     if (fp) {
         int len = fprintf(fp, "%10s %30s %30s %30s %30s %15s\n", "SEQ", "T2_HW", "T2_SW", "T3_SW", "T3_HW", "RESPONSE");
 	for (int i = 0; i < len - 1; i++) {
@@ -485,7 +485,7 @@ void print_usage(const char *progname) {
     printf("  -w, --warmup <pkts>           Number of warmup packets to discard\n");
     printf("  -s, --sw-timestamps           Collect software timestamps\n");
     printf("  -H, --histogram               Show histogram summary\n");
-    printf("  -l, --log                     Write transaction log to file\n");
+    printf("  -l, --log <file>              Write transaction log to file\n");
     printf("  -o, --overflow <us>           Histogram overflow bucket threshold (default: 100us)\n");
     printf("  -b, --bucket-size <us>        Histogram bucket size (default: 1us)\n");
     printf("  -h, --help                    Show this help message\n");
@@ -499,7 +499,7 @@ int main(int argc, char **argv) {
         .threshold = 0,
         .use_sw_timestamps = 0,
 	.show_histogram = 0,
-	.write_log = 0,
+	.log_file = NULL,
 	.bucket_overflow = DEFAULT_BUCKET_OVERFLOW_NS,
         .bucket_size = DEFAULT_BUCKET_SIZE_NS,
 	.duration =0,
@@ -520,13 +520,13 @@ int main(int argc, char **argv) {
         {"threshold",     required_argument, 0, 't'},
         {"sw-timestamps", no_argument,       0, 's'},
         {"histogram",     no_argument,       0, 'H'},
-        {"log",           no_argument,       0, 'l'},
+        {"log",           required_argument, 0, 'l'},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:sHlh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:sHl:h", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -592,7 +592,7 @@ int main(int argc, char **argv) {
 		config.show_histogram = 1;
 		break;
 	    case 'l':
-		config.write_log = 1;
+		config.log_file = optarg;
 		break;
 	    case 'h':
 		print_usage(argv[0]);
@@ -621,14 +621,14 @@ int main(int argc, char **argv) {
     /* Reflect (server) */
     if (config.ip == NULL) {
         reflect(config);
-	if (config.write_log)
-	    response_log();
+	if (config.log_file)
+	    response_log(config.log_file);
     }
     /* Emit (client) */
     else {
         emit(config);
-	if (config.write_log)
-	    roundtrip_log();
+	if (config.log_file)
+	    roundtrip_log(config.log_file);
     }
     show_stats();
     if (config.show_histogram)

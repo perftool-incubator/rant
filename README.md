@@ -56,7 +56,7 @@ Optional:
     --warmup <pkts>           Number of warmup packets to discard from statistics
     --sw-timestamps           Collect software timestamps
     --histogram               Show histogram summary
-    --log                     Write transaction log to file
+    --log <file>              Write transaction log to file
     --overflow <us>           Histogram overflow bucket threshold (default: 100us)
     --bucket-size <us>        Histogram bucket size (default: 1us)
     --help                    Show help message
