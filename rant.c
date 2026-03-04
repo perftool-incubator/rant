@@ -41,6 +41,7 @@ typedef struct {
     uint64_t warmup;
     int busy_poll_budget;
     int prefer_busy_poll;
+    int blocking_poll;
 } config_t;
 
 uint64_t *histogram = NULL;
@@ -112,9 +113,9 @@ void histogram_record(long long delta, config_t cfg) {
 	stats.max = delta;
     }
     uint32_t bucket_index = (uint32_t) delta / cfg.bucket_size;
-    if (bucket_index >= cfg.bucket_overflow) {
+    if (bucket_index >= bucket_max) {
+        overflow_samples[histogram[bucket_max]]=delta;
 	bucket_index = bucket_max;
-        overflow_samples[histogram[bucket_index]]=delta;
     }
     histogram[bucket_index]++;
 }
@@ -137,7 +138,7 @@ uint64_t get_percentile(double percentile, config_t cfg) {
 
     uint64_t running_sum = 0;
     /* Find the bucket that crosses the target */
-    for (int i = 0; i <= cfg.bucket_overflow; ++i) {
+    for (int i = 0; i < bucket_max; ++i) {
         running_sum += histogram[i];
         if (running_sum >= target) {
             /* Return the avg latency in the *middle* of this bucket */
@@ -284,7 +285,8 @@ void emit(config_t cfg) {
         msg_rx.msg_flags = 0;
 
 	/* wait for pong */
-        while ((poll(&pfd_rx, 1, 0) <= 0) && (keep_running ))
+        int poll_timeout = cfg.blocking_poll ? -1 : 0;
+        while ((poll(&pfd_rx, 1, poll_timeout) <= 0) && (keep_running ))
             continue;		
 	
         /* Packet arrived: Receive Pong & Get RX Timestamp */
@@ -390,7 +392,8 @@ void reflect(config_t cfg) {
         msg_rx.msg_flags = 0;
 
 	/* Wait for Ping */
-        if (poll(&pfd_rx, 1, 0) <= 0)
+        int poll_timeout = cfg.blocking_poll ? -1 : 0;
+        if (poll(&pfd_rx, 1, poll_timeout) <= 0)
 	    continue;
 
         /* Packet arrived: Receive Ping & Get RX Timestamp */
@@ -541,7 +544,8 @@ int main(int argc, char **argv) {
 	.duration =0,
 	.warmup = 0,
 	.busy_poll_budget = 0,
-	.prefer_busy_poll = 0
+	.prefer_busy_poll = 0,
+	.blocking_poll = 0
     };
     
     bucket_max = DEFAULT_BUCKET_MAX;
@@ -561,12 +565,13 @@ int main(int argc, char **argv) {
         {"log",              required_argument, 0, 'l'},
         {"budget",           required_argument, 0, 'B'},
         {"prefer-busypoll",  no_argument,       0, 'P'},
+        {"blocking-poll",    no_argument,       0, 'K'},
         {"help",             no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:sHl:B:Ph", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:sHl:B:PKh", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -643,6 +648,9 @@ int main(int argc, char **argv) {
 		break;
 	    case 'P':  // --prefer-busypoll
 		config.prefer_busy_poll = 1;
+		break;
+	    case 'K':  // --blocking-poll
+		config.blocking_poll = 1;
 		break;
 	    case 'h':
 		print_usage(argv[0]);
