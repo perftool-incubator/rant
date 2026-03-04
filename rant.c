@@ -101,7 +101,6 @@ uint64_t calibrate_rdtsc() {
 
 /* Record sample in the histogram */
 void histogram_record(long long delta, config_t cfg) {
-    stats.count++;
     if (delta < 0) delta = 0;
     stats.sum += delta;
     if (delta < stats.min) {
@@ -112,6 +111,7 @@ void histogram_record(long long delta, config_t cfg) {
 	stats.max_idx = stats.count;
 	stats.max = delta;
     }
+    stats.count++;
     uint32_t bucket_index = (uint32_t) delta / cfg.bucket_size;
     if (bucket_index >= bucket_max) {
         overflow_samples[histogram[bucket_max]]=delta;
@@ -254,10 +254,22 @@ void emit(config_t cfg) {
     uint64_t test_start_tsc = start_tsc;
     uint64_t deadline = cfg.duration > 0 ? start_tsc + (cfg.duration * cycles_per_sec): 0;
     uint64_t packet_count = 0;
+    struct record warmup_record;  /* Temporary storage for warmup packets */
+    struct record *rtt;
 
     while (keep_running) {
 
-        struct record *rtt = &log_book[log_size++];
+        /* Start timing when warmup completes, before first test packet */
+        if (packet_count == cfg.warmup) {
+            test_start_tsc = rdtsc();
+        }
+
+        /* Only save to log_book after warmup */
+        if (packet_count >= cfg.warmup) {
+            rtt = &log_book[log_size++];
+        } else {
+            rtt = &warmup_record;
+        }
 
         /* Reset length before fetching from Error Queue */
     	msg_tx.msg_controllen = sizeof(cbuf_tx); 
@@ -307,8 +319,6 @@ void emit(config_t cfg) {
             packet_count++;
             if (packet_count > cfg.warmup) {
 	        histogram_record(rtt->delta, cfg);
-		if (packet_count == cfg.warmup + 1)
-		    test_start_tsc = rdtsc();
 	    }
 
             if (cfg.threshold > 0 && rtt->delta > cfg.threshold) {
@@ -384,8 +394,15 @@ void reflect(config_t cfg) {
     uint64_t test_start_tsc = start_tsc;
     uint64_t deadline = cfg.duration > 0 ? start_tsc + (cfg.duration * cycles_per_sec): 0;
     uint64_t packet_count = 0;
+    struct record warmup_record;  /* Temporary storage for warmup packets */
+    struct record *resp;
 
     while (keep_running) {
+
+        /* Start timing when warmup completes, before first test packet */
+        if (packet_count == cfg.warmup) {
+            test_start_tsc = rdtsc();
+        }
 
         /* Reset length before fetching Ping pkt */
     	msg_rx.msg_controllen = sizeof(cbuf_rx);
@@ -399,7 +416,12 @@ void reflect(config_t cfg) {
         /* Packet arrived: Receive Ping & Get RX Timestamp */
         if (recvmsg(s, &msg_rx, 0) > 0) {
 
-	    struct record *resp = &log_book[log_size++];
+	    /* Only save to log_book after warmup */
+	    if (packet_count >= cfg.warmup) {
+	        resp = &log_book[log_size++];
+	    } else {
+	        resp = &warmup_record;
+	    }
 
             if (cfg.use_sw_timestamps) {
 	        /* T2_SW: Software timestamp when ping is received */
@@ -438,8 +460,6 @@ void reflect(config_t cfg) {
             packet_count++;
             if (packet_count > cfg.warmup) {
 	        histogram_record(resp->delta, cfg);
-		if (packet_count == cfg.warmup + 1)
-		    test_start_tsc = rdtsc();
 	    }
 
             if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
