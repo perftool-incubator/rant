@@ -41,7 +41,6 @@ typedef struct {
     uint64_t warmup;
     int busy_poll_budget;
     int prefer_busy_poll;
-    int blocking_poll;
 } config_t;
 
 uint64_t *histogram = NULL;
@@ -287,7 +286,9 @@ void emit(config_t cfg) {
 	sendto(s, buf_tx, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
 
         /* T1_HW: Hardware timestamp when ping in sent */
-        if (poll(&pfd_tx, 1, 2) > 0) {
+        while (poll(&pfd_tx, 1, 0) <= 0 && keep_running)
+            continue;
+        if (keep_running) {
             recvmsg(s, &msg_tx, MSG_ERRQUEUE);
             get_ts(&msg_tx, &rtt->hw_tx);
         }
@@ -297,8 +298,7 @@ void emit(config_t cfg) {
         msg_rx.msg_flags = 0;
 
 	/* wait for pong */
-        int poll_timeout = cfg.blocking_poll ? -1 : 0;
-        while ((poll(&pfd_rx, 1, poll_timeout) <= 0) && (keep_running ))
+        while ((poll(&pfd_rx, 1, 0) <= 0) && (keep_running ))
             continue;		
 	
         /* Packet arrived: Receive Pong & Get RX Timestamp */
@@ -409,8 +409,7 @@ void reflect(config_t cfg) {
         msg_rx.msg_flags = 0;
 
 	/* Wait for Ping */
-        int poll_timeout = cfg.blocking_poll ? -1 : 0;
-        if (poll(&pfd_rx, 1, poll_timeout) <= 0)
+        if (poll(&pfd_rx, 1, 0) <= 0)
 	    continue;
 
         /* Packet arrived: Receive Ping & Get RX Timestamp */
@@ -447,7 +446,9 @@ void reflect(config_t cfg) {
             sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
 
             /* T3_HW: Hardware timestamp when pong is sent */
-            if (poll(&pfd_tx, 1, 2) > 0) {
+            while (poll(&pfd_tx, 1, 0) <= 0 && keep_running)
+                continue;
+            if (keep_running) {
                 recvmsg(s, &msg_tx, MSG_ERRQUEUE);
                 get_ts(&msg_tx, &resp->hw_tx);
             }
@@ -564,8 +565,7 @@ int main(int argc, char **argv) {
 	.duration =0,
 	.warmup = 0,
 	.busy_poll_budget = 0,
-	.prefer_busy_poll = 0,
-	.blocking_poll = 0
+	.prefer_busy_poll = 0
     };
     
     bucket_max = DEFAULT_BUCKET_MAX;
@@ -585,13 +585,12 @@ int main(int argc, char **argv) {
         {"log",              required_argument, 0, 'l'},
         {"budget",           required_argument, 0, 'B'},
         {"prefer-busypoll",  no_argument,       0, 'P'},
-        {"blocking-poll",    no_argument,       0, 'K'},
         {"help",             no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:sHl:B:PKh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:sHl:B:Ph", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -668,9 +667,6 @@ int main(int argc, char **argv) {
 		break;
 	    case 'P':  // --prefer-busypoll
 		config.prefer_busy_poll = 1;
-		break;
-	    case 'K':  // --blocking-poll
-		config.blocking_poll = 1;
 		break;
 	    case 'h':
 		print_usage(argv[0]);
