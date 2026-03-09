@@ -286,9 +286,11 @@ void emit(config_t cfg) {
 	sendto(s, buf_tx, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
 
         /* T1_HW: Hardware timestamp when ping in sent */
-        while (poll(&pfd_tx, 1, 0) <= 0 && keep_running)
-            continue;
-        if (keep_running) {
+        while (poll(&pfd_tx, 1, 0) <= 0 && keep_running) {
+            if (cfg.duration > 0 && rdtsc() > deadline)
+                break;
+        }
+        if (keep_running && !(cfg.duration > 0 && rdtsc() > deadline)) {
             recvmsg(s, &msg_tx, MSG_ERRQUEUE);
             get_ts(&msg_tx, &rtt->hw_tx);
         }
@@ -298,9 +300,15 @@ void emit(config_t cfg) {
         msg_rx.msg_flags = 0;
 
 	/* wait for pong */
-        while ((poll(&pfd_rx, 1, 0) <= 0) && (keep_running ))
-            continue;		
-	
+        while ((poll(&pfd_rx, 1, 0) <= 0) && (keep_running )) {
+            if (cfg.duration > 0 && rdtsc() > deadline)
+                break;
+        }
+
+        /* Check if we timed out */
+        if (cfg.duration > 0 && rdtsc() > deadline)
+            break;
+
         /* Packet arrived: Receive Pong & Get RX Timestamp */
         if (recvmsg(s, &msg_rx, 0) > 0) {
 
@@ -446,9 +454,11 @@ void reflect(config_t cfg) {
             sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
 
             /* T3_HW: Hardware timestamp when pong is sent */
-            while (poll(&pfd_tx, 1, 0) <= 0 && keep_running)
-                continue;
-            if (keep_running) {
+            while (poll(&pfd_tx, 1, 0) <= 0 && keep_running) {
+                if (cfg.duration > 0 && rdtsc() > deadline)
+                    break;
+            }
+            if (keep_running && !(cfg.duration > 0 && rdtsc() > deadline)) {
                 recvmsg(s, &msg_tx, MSG_ERRQUEUE);
                 get_ts(&msg_tx, &resp->hw_tx);
             }
