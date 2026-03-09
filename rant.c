@@ -290,8 +290,7 @@ void emit(config_t cfg) {
             if (cfg.duration > 0 && rdtsc() > deadline)
                 break;
         }
-        if (keep_running && !(cfg.duration > 0 && rdtsc() > deadline)) {
-            recvmsg(s, &msg_tx, MSG_ERRQUEUE);
+	if (recvmsg(s, &msg_tx, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {
             get_ts(&msg_tx, &rtt->hw_tx);
         }
 
@@ -300,17 +299,13 @@ void emit(config_t cfg) {
         msg_rx.msg_flags = 0;
 
 	/* wait for pong */
-        while ((poll(&pfd_rx, 1, 0) <= 0) && (keep_running )) {
+        while (poll(&pfd_rx, 1, 0) <= 0 && keep_running) {
             if (cfg.duration > 0 && rdtsc() > deadline)
                 break;
         }
 
-        /* Check if we timed out */
-        if (cfg.duration > 0 && rdtsc() > deadline)
-            break;
-
         /* Packet arrived: Receive Pong & Get RX Timestamp */
-        if (recvmsg(s, &msg_rx, 0) > 0) {
+        if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
 
             /* T4_SW: Software timestamp when pong is received */
             if (cfg.use_sw_timestamps)
@@ -336,7 +331,7 @@ void emit(config_t cfg) {
             }
         }
 
-        /* Check duration at end of loop to ensure we exceed the specified duration */
+	/* check if duration timed out */
         if (cfg.duration > 0 && rdtsc() > deadline)
             break;
     }
@@ -417,11 +412,13 @@ void reflect(config_t cfg) {
         msg_rx.msg_flags = 0;
 
 	/* Wait for Ping */
-        if (poll(&pfd_rx, 1, 0) <= 0)
-	    continue;
+        while (poll(&pfd_rx, 1, 0) <= 0 && keep_running) {
+            if (cfg.duration > 0 && rdtsc() > deadline)
+                break;
+	}
 
         /* Packet arrived: Receive Ping & Get RX Timestamp */
-        if (recvmsg(s, &msg_rx, 0) > 0) {
+        if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
 
 	    /* Only save to log_book after warmup */
 	    if (packet_count >= cfg.warmup) {
@@ -458,8 +455,7 @@ void reflect(config_t cfg) {
                 if (cfg.duration > 0 && rdtsc() > deadline)
                     break;
             }
-            if (keep_running && !(cfg.duration > 0 && rdtsc() > deadline)) {
-                recvmsg(s, &msg_tx, MSG_ERRQUEUE);
+            if (recvmsg(s, &msg_tx, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {
                 get_ts(&msg_tx, &resp->hw_tx);
             }
 
@@ -481,7 +477,7 @@ void reflect(config_t cfg) {
             }
         }
 
-        /* Check duration at end of loop to ensure we exceed the specified duration */
+	/* check if duration timed out */
         if (cfg.duration > 0 && rdtsc() > deadline)
             break;
     }
