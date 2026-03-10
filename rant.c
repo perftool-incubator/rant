@@ -707,6 +707,17 @@ int main(int argc, char **argv) {
     overflow_samples = calloc(overflow_capacity, sizeof(uint64_t));
     if (overflow_samples == NULL) return 1;
 
+    /* Lock all memory pages in RAM to prevent page faults during test */
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        perror("mlockall");
+        fprintf(stderr, "Warning: Cannot lock memory in RAM. May experience page fault delays.\n");
+        fprintf(stderr, "Try: sudo setcap cap_ipc_lock=+ep %s\n", argv[0]);
+        fprintf(stderr, "Or run with: ulimit -l unlimited\n");
+        fprintf(stderr, "Continuing without memory lock...\n\n");
+    } else {
+        fprintf(stderr, "Memory locked in RAM (mlockall successful)\n\n");
+    }
+
     /* Reflect (server) */
     if (config.ip == NULL) {
         reflect(config);
