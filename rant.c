@@ -67,7 +67,7 @@ struct Stats stats = { 0x7FFFFFFFFFFFFFFFLL, 0, 0, 0, 0, 0 };
 
 struct record *log_book = NULL;
 size_t log_size = 0;
-size_t log_capacity = 10000000000;
+size_t log_capacity = 0;  // Calculated based on test duration
 volatile sig_atomic_t keep_running = 1;
 
 void handle_sig(int sig) {
@@ -687,6 +687,15 @@ int main(int argc, char **argv) {
 	print_usage(argv[0]);
 	return 1;
     }
+
+    /* Calculate log_capacity based on test duration */
+    uint64_t duration_seconds = config.duration > 0 ? config.duration : (24 * 3600);  /* Default: 24 hours */
+    uint64_t expected_samples = duration_seconds * 50000;  /* Assume 50k samples/sec */
+    log_capacity = (size_t)(expected_samples * 1.15);  /* Add 15% buffer */
+
+    fprintf(stderr, "Allocating log memory for %lu seconds (%.1f hours): %zu records (%.2f GB)\n",
+        duration_seconds, duration_seconds / 3600.0, log_capacity,
+        (log_capacity * sizeof(struct record)) / (1024.0 * 1024.0 * 1024.0));
 
     log_book = calloc(log_capacity, sizeof(struct record));
     if (log_book == NULL) return 1;
