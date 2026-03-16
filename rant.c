@@ -15,6 +15,8 @@
 #include <sys/mman.h>
 #include <linux/mman.h>
 #include <inttypes.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #ifndef SO_PREFER_BUSY_POLL
 #define SO_PREFER_BUSY_POLL 69
@@ -41,6 +43,8 @@ typedef struct {
     uint64_t warmup;
     int busy_poll_budget;
     int prefer_busy_poll;
+    int use_hugepages;
+    int enable_trace_marker;
 } config_t;
 
 uint64_t *histogram = NULL;
@@ -48,11 +52,13 @@ uint64_t bucket_max;
 
 size_t overflow_capacity = 500000000;
 uint64_t *overflow_samples = NULL;
+size_t overflow_samples_bytes = 0;  // Track allocation size for munmap
+int using_hugepages_overflow = 0;  // Track if overflow used hugepages
 
 struct record {
     struct timespec hw_tx, hw_rx, sw_tx, sw_rx;
     uint64_t delta;
-};
+};  /* 72 bytes natural packing - cache alignment removed due to memory cost */
 
 struct Stats {
     uint64_t min;
@@ -68,7 +74,12 @@ struct Stats stats = { 0x7FFFFFFFFFFFFFFFLL, 0, 0, 0, 0, 0 };
 struct record *log_book = NULL;
 size_t log_size = 0;
 size_t log_capacity = 0;  // Calculated based on test duration
+size_t log_book_bytes = 0;  // Track allocation size for munmap
+int using_hugepages = 0;  // Track if hugepages were successfully allocated
 volatile sig_atomic_t keep_running = 1;
+
+/* Trace marker file descriptor for kernel tracing integration */
+int trace_marker_fd = -1;
 
 void handle_sig(int sig) {
     keep_running = 0;
@@ -96,6 +107,41 @@ uint64_t calibrate_rdtsc() {
     uint64_t end = rdtsc();
     /* Cycles Per Second */
     return end - start;
+}
+
+/* Open trace_marker for kernel tracing integration */
+void open_trace_marker() {
+    /* Try debugfs location first */
+    trace_marker_fd = open("/sys/kernel/debug/tracing/trace_marker", O_WRONLY);
+    if (trace_marker_fd < 0) {
+        /* Try tracefs location */
+        trace_marker_fd = open("/sys/kernel/tracing/trace_marker", O_WRONLY);
+        if (trace_marker_fd < 0) {
+            fprintf(stderr, "Warning: Cannot open trace_marker: %s\n", strerror(errno));
+            fprintf(stderr, "  Kernel tracing integration disabled.\n");
+            fprintf(stderr, "  Try: sudo mount -t tracefs nodev /sys/kernel/tracing\n");
+            fprintf(stderr, "  Or: sudo mount -t debugfs nodev /sys/kernel/debug\n\n");
+            trace_marker_fd = -1;
+        }
+    }
+    if (trace_marker_fd >= 0) {
+        fprintf(stderr, "Trace marker enabled for kernel tracing integration\n\n");
+    }
+}
+
+/* Close trace_marker file descriptor */
+void close_trace_marker() {
+    if (trace_marker_fd >= 0) {
+        close(trace_marker_fd);
+        trace_marker_fd = -1;
+    }
+}
+
+/* Write to trace_marker when threshold exceeded */
+void write_trace_marker(const char *msg) {
+    if (trace_marker_fd >= 0) {
+        write(trace_marker_fd, msg, strlen(msg));
+    }
 }
 
 /* Record sample in the histogram */
@@ -263,8 +309,16 @@ void emit(config_t cfg) {
             test_start_tsc = rdtsc();
         }
 
-        /* Only save to log_book after warmup */
-        if (packet_count >= cfg.warmup) {
+        /* Only save to log_book after warmup and if logging enabled */
+        if (packet_count >= cfg.warmup && log_book != NULL) {
+            /* Check if log capacity exceeded */
+            if (log_size >= log_capacity) {
+                fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records)\n", log_capacity);
+                fprintf(stderr, "  Stopping test to prevent buffer overflow.\n");
+                fprintf(stderr, "  Consider using -d <seconds> for shorter tests or increase capacity.\n");
+                keep_running = 0;
+                break;
+            }
             rtt = &log_book[log_size++];
         } else {
             rtt = &warmup_record;
@@ -307,7 +361,7 @@ void emit(config_t cfg) {
         /* Packet arrived: Receive Pong & Get RX Timestamp */
         if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
 
-            /* T4_SW: Software timestamp when pong is received */
+            /* T4_SW: Software timestamp IMMEDIATELY after recvmsg (before ANY other code) */
             if (cfg.use_sw_timestamps)
 		clock_gettime(CLOCK_TAI, &rtt->sw_rx);
 
@@ -322,12 +376,24 @@ void emit(config_t cfg) {
             packet_count++;
             if (packet_count > cfg.warmup) {
 	        histogram_record(rtt->delta, cfg);
-	    }
 
-            if (cfg.threshold > 0 && rtt->delta > cfg.threshold) {
-                printf("Round-Trip latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
-			rtt->delta, cfg.threshold);
-                break;
+		if (cfg.threshold > 0 && rtt->delta > cfg.threshold) {
+		    printf("Round-Trip latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
+			   rtt->delta, cfg.threshold);
+
+		    /* Write to trace_marker for kernel tracing correlation */
+		    if (trace_marker_fd >= 0) {
+			char trace_msg[256];
+			snprintf(trace_msg, sizeof(trace_msg),
+				 "rant: RTT threshold exceeded: seq=%"PRIu64" latency=%"PRIu64"ns threshold=%"PRIu64"ns\n",
+				 packet_count, rtt->delta, cfg.threshold);
+			write_trace_marker(trace_msg);
+		    }
+
+		    /* exit early: threshold exceeded */
+		    keep_running = 0;
+		    break;
+	        }
             }
         }
 
@@ -420,19 +486,34 @@ void reflect(config_t cfg) {
         /* Packet arrived: Receive Ping & Get RX Timestamp */
         if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
 
-	    /* Only save to log_book after warmup */
-	    if (packet_count >= cfg.warmup) {
+            /* T2_SW: Software timestamp IMMEDIATELY after recvmsg (before ANY other code) */
+            struct timespec t2_sw_immediate;
+            if (cfg.use_sw_timestamps) {
+	        clock_gettime(CLOCK_TAI, &t2_sw_immediate);
+            }
+
+            /* T2_HW: Hardware timestamp when ping is received (extract from cmsg) */
+            struct timespec t2_hw;
+            get_ts(&msg_rx, &t2_hw);
+
+	    /* NOW do application logic (pointer assignment, warmup check, etc.) */
+	    if (packet_count >= cfg.warmup && log_book != NULL) {
+	        /* Check if log capacity exceeded */
+	        if (log_size >= log_capacity) {
+	            fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records)\n", log_capacity);
+	            fprintf(stderr, "  Stopping test to prevent buffer overflow.\n");
+	            fprintf(stderr, "  Consider using -d <seconds> for shorter tests or increase capacity.\n");
+	            keep_running = 0;
+	            break;
+	        }
 	        resp = &log_book[log_size++];
 	    } else {
 	        resp = &warmup_record;
 	    }
 
-            if (cfg.use_sw_timestamps) {
-	        /* T2_SW: Software timestamp when ping is received */
-	        clock_gettime(CLOCK_TAI, &resp->sw_rx);
-            }
-            /* T2_HW: Hardware timestamp when ping is received */
-            get_ts(&msg_rx, &resp->hw_rx);
+            /* Store the immediately-captured timestamps */
+            resp->sw_rx = t2_sw_immediate;
+            resp->hw_rx = t2_hw;
 
 	    /* Reset length before fetching from Error Queue */
     	    msg_tx.msg_controllen = sizeof(cbuf_tx); 
@@ -467,13 +548,24 @@ void reflect(config_t cfg) {
             packet_count++;
             if (packet_count > cfg.warmup) {
 	        histogram_record(resp->delta, cfg);
-	    }
 
-            if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
-                printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
-			resp->delta, cfg.threshold);
-		keep_running = 0;
-                break;
+		if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
+		    printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
+			   resp->delta, cfg.threshold);
+
+		    /* Write to trace_marker for kernel tracing correlation */
+		    if (trace_marker_fd >= 0) {
+			char trace_msg[256];
+			snprintf(trace_msg, sizeof(trace_msg),
+				 "rant: Response threshold exceeded: seq=%"PRIu64" latency=%"PRIu64"ns threshold=%"PRIu64"ns\n",
+				 packet_count, resp->delta, cfg.threshold);
+			write_trace_marker(trace_msg);
+		    }
+
+		    /* exit early: threshold exceeded */
+		    keep_running = 0;
+		    break;
+		}
             }
         }
 
@@ -544,7 +636,8 @@ void print_usage(const char *progname) {
     printf("  -i, --interface <iface>       Network interface to use\n\n");
     printf("Optional:\n");
     printf("  -a, --address <ip>            Server IP address (client mode)\n");
-    printf("  -t, --threshold <us>          Stop when latency exceeds threshold (microseconds)\n");
+    printf("  -t, --threshold <us>          Stop when latency exceeds threshold (microseconds, after warmup)\n");
+    printf("  -T, --trace-marker            Enable kernel trace_marker integration (requires -t)\n");
     printf("  -d, --duration <sec>          Test duration in seconds\n");
     printf("  -w, --warmup <pkts>           Number of warmup packets to discard\n");
     printf("  -s, --sw-timestamps           Collect software timestamps\n");
@@ -552,6 +645,7 @@ void print_usage(const char *progname) {
     printf("  -l, --log <file>              Write transaction log to file\n");
     printf("  -o, --overflow <us>           Histogram overflow bucket threshold (default: 100us)\n");
     printf("  -b, --bucket-size <us>        Histogram bucket size (default: 1us)\n");
+    printf("  -G, --hugepages               Use hugepages for memory allocation (requires system config)\n");
     printf("  -B, --budget <budget>         Set SO_BUSY_POLL_BUDGET (NAPI poll budget)\n");
     printf("  -P, --prefer-busypoll         Set SO_PREFER_BUSY_POLL (prefer busy poll over interrupt)\n");
     printf("  -h, --help                    Show this help message\n");
@@ -571,7 +665,9 @@ int main(int argc, char **argv) {
 	.duration =0,
 	.warmup = 0,
 	.busy_poll_budget = 0,
-	.prefer_busy_poll = 0
+	.prefer_busy_poll = 0,
+	.use_hugepages = 0,
+	.enable_trace_marker = 0
     };
     
     bucket_max = DEFAULT_BUCKET_MAX;
@@ -586,9 +682,11 @@ int main(int argc, char **argv) {
         {"interface",        required_argument, 0, 'i'},
         {"address",          required_argument, 0, 'a'},
         {"threshold",        required_argument, 0, 't'},
+        {"trace-marker",     no_argument,       0, 'T'},
         {"sw-timestamps",    no_argument,       0, 's'},
         {"histogram",        no_argument,       0, 'H'},
         {"log",              required_argument, 0, 'l'},
+        {"hugepages",        no_argument,       0, 'G'},
         {"budget",           required_argument, 0, 'B'},
         {"prefer-busypoll",  no_argument,       0, 'P'},
         {"help",             no_argument,       0, 'h'},
@@ -596,7 +694,7 @@ int main(int argc, char **argv) {
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:sHl:B:Ph", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TsHl:GB:Ph", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -653,7 +751,10 @@ int main(int argc, char **argv) {
 				    "fallback to default.\n");
                 }
 		/* Converto us to ns */
-		config.threshold = threshold * 1000; 
+		config.threshold = threshold * 1000;
+                break;
+            case 'T':  // --trace-marker
+                config.enable_trace_marker = 1;
                 break;
             case 's':
                 config.use_sw_timestamps = 1;
@@ -663,6 +764,9 @@ int main(int argc, char **argv) {
 		break;
 	    case 'l':
 		config.log_file = optarg;
+		break;
+	    case 'G':  // --hugepages
+		config.use_hugepages = 1;
 		break;
 	    case 'B':  // --budget
 		config.busy_poll_budget = atoi(optarg);
@@ -688,24 +792,143 @@ int main(int argc, char **argv) {
 	return 1;
     }
 
-    /* Calculate log_capacity based on test duration */
-    uint64_t duration_seconds = config.duration > 0 ? config.duration : (24 * 3600);  /* Default: 24 hours */
-    uint64_t expected_samples = duration_seconds * 50000;  /* Assume 50k samples/sec */
-    log_capacity = (size_t)(expected_samples * 1.15);  /* Add 15% buffer */
+    /* Open trace_marker if both threshold and trace-marker flag are specified */
+    if (config.threshold > 0 && config.enable_trace_marker) {
+        open_trace_marker();
+    }
 
-    fprintf(stderr, "Allocating log memory for %lu seconds (%.1f hours): %zu records (%.2f GB)\n",
-        duration_seconds, duration_seconds / 3600.0, log_capacity,
-        (log_capacity * sizeof(struct record)) / (1024.0 * 1024.0 * 1024.0));
+    /* Only allocate log_book if --log is specified */
+    if (config.log_file == NULL) {
+        fprintf(stderr, "No --log file specified, logging disabled\n\n");
+        log_book = NULL;
+        log_capacity = 0;
+        log_book_bytes = 0;
+    } else {
+        /* Calculate log_capacity based on test duration or default to 1 hour equivalent */
+        uint64_t duration_for_capacity;
 
-    log_book = calloc(log_capacity, sizeof(struct record));
-    if (log_book == NULL) return 1;
+        if (config.duration > 0) {
+            duration_for_capacity = config.duration;
+        } else {
+            /* Default: 1 hour worth of samples (~25GB with cache alignment) */
+            duration_for_capacity = 3600;
+        }
+
+        uint64_t expected_samples = duration_for_capacity * 50000;  /* Assume 50k samples/sec */
+        log_capacity = (size_t)(expected_samples * 1.15);  /* Add 15% buffer */
+        log_book_bytes = log_capacity * sizeof(struct record);
+
+        size_t required_gb = log_book_bytes / (1024ULL * 1024 * 1024);
+
+        fprintf(stderr, "Allocating log memory for ~%lu seconds (%.1f hours): %zu records (%.2f GB)\n",
+            duration_for_capacity, duration_for_capacity / 3600.0, log_capacity,
+            log_book_bytes / (1024.0 * 1024.0 * 1024.0));
+
+        /* Sanity check: warn if allocation is very large (>256 GB) */
+        if (required_gb > 256) {
+            fprintf(stderr, "\nWARNING: Allocation size (%zu GB) exceeds 256 GB!\n", required_gb);
+            fprintf(stderr, "  This may cause the system to hang or run out of memory.\n");
+            fprintf(stderr, "  Consider using -d <seconds> to specify a shorter test duration.\n");
+            fprintf(stderr, "  Press Ctrl-C now to abort, or wait 5 seconds to continue...\n\n");
+            sleep(5);
+        }
+
+        if (config.use_hugepages) {
+            /* Try to allocate with hugepages */
+            fprintf(stderr, "Attempting hugepage allocation (use -G flag)...\n");
+
+            /* Try 2MB hugepages first (21 = log2(2MB)) */
+            log_book = mmap(NULL, log_book_bytes,
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (21 << MAP_HUGE_SHIFT),
+                            -1, 0);
+
+            if (log_book == MAP_FAILED) {
+                fprintf(stderr, "Warning: 2MB hugepages not available, trying default hugepages...\n");
+
+                /* Try default hugepages without size specification */
+                log_book = mmap(NULL, log_book_bytes,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                                -1, 0);
+
+                if (log_book == MAP_FAILED) {
+                    fprintf(stderr, "Warning: Hugepages not available, falling back to regular allocation\n");
+                    fprintf(stderr, "  To configure hugepages, run:\n");
+                    fprintf(stderr, "    sudo sh -c 'echo %zu > /proc/sys/vm/nr_hugepages'\n",
+                            (log_book_bytes / (2 * 1024 * 1024)) + 1);
+
+                    /* Fallback to calloc */
+                    log_book = calloc(log_capacity, sizeof(struct record));
+                    if (log_book == NULL) {
+                        perror("calloc failed");
+                        return 1;
+                    }
+                    using_hugepages = 0;
+                    fprintf(stderr, "Allocated %.2f GB using regular memory (calloc)\n\n",
+                            log_book_bytes / (1024.0 * 1024.0 * 1024.0));
+                } else {
+                    using_hugepages = 1;
+                    fprintf(stderr, "Allocated %.2f GB using default hugepages\n\n",
+                            log_book_bytes / (1024.0 * 1024.0 * 1024.0));
+                }
+            } else {
+                using_hugepages = 1;
+                fprintf(stderr, "Allocated %.2f GB using 2MB hugepages\n\n",
+                        log_book_bytes / (1024.0 * 1024.0 * 1024.0));
+            }
+        } else {
+            /* Default: use regular calloc allocation */
+            log_book = calloc(log_capacity, sizeof(struct record));
+            if (log_book == NULL) {
+                perror("calloc failed");
+                return 1;
+            }
+            using_hugepages = 0;
+            fprintf(stderr, "Allocated %.2f GB using regular memory (calloc)\n",
+                    log_book_bytes / (1024.0 * 1024.0 * 1024.0));
+            fprintf(stderr, "  Tip: Use -G flag for hugepage optimization\n\n");
+        }
+    }
 
     /* [0-bucket_max-1]: buckets, [bucket_max]: overflows */
     histogram = calloc(bucket_max+1, sizeof(uint64_t));
     if (histogram == NULL) return 1;
 
-    overflow_samples = calloc(overflow_capacity, sizeof(uint64_t));
-    if (overflow_samples == NULL) return 1;
+    /* Allocate overflow_samples (4GB array) */
+    overflow_samples_bytes = overflow_capacity * sizeof(uint64_t);
+
+    if (config.use_hugepages) {
+        fprintf(stderr, "Allocating overflow buffer: %.2f GB (with hugepages)\n",
+                overflow_samples_bytes / (1024.0 * 1024.0 * 1024.0));
+
+        overflow_samples = mmap(NULL, overflow_samples_bytes,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (21 << MAP_HUGE_SHIFT),
+                                -1, 0);
+
+        if (overflow_samples == MAP_FAILED) {
+            /* Fallback to calloc */
+            overflow_samples = calloc(overflow_capacity, sizeof(uint64_t));
+            if (overflow_samples == NULL) {
+                perror("calloc overflow_samples failed");
+                return 1;
+            }
+            using_hugepages_overflow = 0;
+            fprintf(stderr, "Overflow buffer using regular memory (calloc)\n\n");
+        } else {
+            using_hugepages_overflow = 1;
+            fprintf(stderr, "Overflow buffer using 2MB hugepages\n\n");
+        }
+    } else {
+        /* Default: use calloc */
+        overflow_samples = calloc(overflow_capacity, sizeof(uint64_t));
+        if (overflow_samples == NULL) {
+            perror("calloc overflow_samples failed");
+            return 1;
+        }
+        using_hugepages_overflow = 0;
+    }
 
     /* Lock all memory pages in RAM to prevent page faults during test */
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
@@ -734,9 +957,25 @@ int main(int argc, char **argv) {
     if (config.show_histogram)
 	histogram_summary(config);
 
-    free(log_book);
+    /* Cleanup: munmap for hugepage allocations, free for regular allocations */
+    if (log_book != NULL) {
+        if (using_hugepages) {
+            munmap(log_book, log_book_bytes);
+        } else {
+            free(log_book);
+        }
+    }
+    if (overflow_samples != NULL) {
+        if (using_hugepages_overflow) {
+            munmap(overflow_samples, overflow_samples_bytes);
+        } else {
+            free(overflow_samples);
+        }
+    }
     free(histogram);
-    free(overflow_samples);
+
+    /* Close trace_marker file descriptor */
+    close_trace_marker();
 
     return 0;
 }
