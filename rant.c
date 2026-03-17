@@ -17,6 +17,7 @@
 #include <inttypes.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/stat.h>
 
 #ifndef SO_PREFER_BUSY_POLL
 #define SO_PREFER_BUSY_POLL 69
@@ -45,6 +46,7 @@ typedef struct {
     int prefer_busy_poll;
     int use_hugepages;
     int enable_trace_marker;
+    int enable_snapshot;
 } config_t;
 
 uint64_t *histogram = NULL;
@@ -80,6 +82,8 @@ volatile sig_atomic_t keep_running = 1;
 
 /* Trace marker file descriptor for kernel tracing integration */
 int trace_marker_fd = -1;
+int tracing_on_fd = -1;
+int snapshot_fd = -1;
 
 void handle_sig(int sig) {
     keep_running = 0;
@@ -109,31 +113,72 @@ uint64_t calibrate_rdtsc() {
     return end - start;
 }
 
-/* Open trace_marker for kernel tracing integration */
+/* Try to open a tracefs file, checking multiple paths */
+static int open_tracefs(const char *filename, int flags) {
+    char path[256];
+    int fd;
+
+    /* Try instance path first (works even if global buffer is corrupted) */
+    snprintf(path, sizeof(path), "/sys/kernel/tracing/instances/rant/%s", filename);
+    fd = open(path, flags);
+    if (fd >= 0) return fd;
+
+    /* Try global tracefs */
+    snprintf(path, sizeof(path), "/sys/kernel/tracing/%s", filename);
+    fd = open(path, flags);
+    if (fd >= 0) return fd;
+
+    /* Try debugfs */
+    snprintf(path, sizeof(path), "/sys/kernel/debug/tracing/%s", filename);
+    fd = open(path, flags);
+    return fd;
+}
+
+/* Open trace_marker and tracing_on for kernel tracing integration */
 void open_trace_marker() {
-    /* Try debugfs location first */
-    trace_marker_fd = open("/sys/kernel/debug/tracing/trace_marker", O_WRONLY);
+    /* Create rant trace instance if it doesn't exist */
+    mkdir("/sys/kernel/tracing/instances/rant", 0755);
+
+    trace_marker_fd = open_tracefs("trace_marker", O_WRONLY);
     if (trace_marker_fd < 0) {
-        /* Try tracefs location */
-        trace_marker_fd = open("/sys/kernel/tracing/trace_marker", O_WRONLY);
-        if (trace_marker_fd < 0) {
-            fprintf(stderr, "Warning: Cannot open trace_marker: %s\n", strerror(errno));
-            fprintf(stderr, "  Kernel tracing integration disabled.\n");
-            fprintf(stderr, "  Try: sudo mount -t tracefs nodev /sys/kernel/tracing\n");
-            fprintf(stderr, "  Or: sudo mount -t debugfs nodev /sys/kernel/debug\n\n");
-            trace_marker_fd = -1;
-        }
-    }
-    if (trace_marker_fd >= 0) {
+        fprintf(stderr, "Warning: Cannot open trace_marker: %s\n", strerror(errno));
+        fprintf(stderr, "  Kernel tracing integration disabled.\n");
+        fprintf(stderr, "  Try: sudo mount -t tracefs nodev /sys/kernel/tracing\n\n");
+    } else {
         fprintf(stderr, "Trace marker enabled for kernel tracing integration\n\n");
+    }
+
+    tracing_on_fd = open_tracefs("tracing_on", O_WRONLY);
+    if (tracing_on_fd < 0)
+        fprintf(stderr, "Warning: Cannot open tracing_on: %s\n", strerror(errno));
+    else
+        write(tracing_on_fd, "1", 1);  /* Ensure tracing is on at start */
+}
+
+/* Open snapshot file descriptor for ftrace snapshot trigger */
+void open_snapshot() {
+    snapshot_fd = open_tracefs("snapshot", O_WRONLY);
+    if (snapshot_fd < 0) {
+        fprintf(stderr, "Warning: Cannot open snapshot: %s\n", strerror(errno));
+        fprintf(stderr, "  Allocate snapshot buffer first: echo 1 > /sys/kernel/tracing/instances/rant/snapshot\n");
+    } else {
+        fprintf(stderr, "Trace snapshot enabled\n");
     }
 }
 
-/* Close trace_marker file descriptor */
+/* Close trace_marker and tracing_on file descriptors */
 void close_trace_marker() {
     if (trace_marker_fd >= 0) {
         close(trace_marker_fd);
         trace_marker_fd = -1;
+    }
+    if (tracing_on_fd >= 0) {
+        close(tracing_on_fd);
+        tracing_on_fd = -1;
+    }
+    if (snapshot_fd >= 0) {
+        close(snapshot_fd);
+        snapshot_fd = -1;
     }
 }
 
@@ -307,6 +352,8 @@ void emit(config_t cfg) {
         /* Start timing when warmup completes, before first test packet */
         if (packet_count == cfg.warmup) {
             test_start_tsc = rdtsc();
+            if (trace_marker_fd >= 0)
+                write_trace_marker("RANT_TEST_START emit\n");
         }
 
         /* Only save to log_book after warmup and if logging enabled */
@@ -324,14 +371,6 @@ void emit(config_t cfg) {
             rtt = &warmup_record;
         }
 
-        /* Reset length before fetching from Error Queue */
-    	msg_tx.msg_controllen = sizeof(cbuf_tx); 
-        msg_tx.msg_flags = 0;
-
-	/* Reset hw_tx to ensure we are not seeing stale data */
-	rtt->hw_tx.tv_sec = 0;
-        rtt->hw_tx.tv_nsec = 0;
-
 	/* T1_SW: Software timestamp when ping is sent */
 	if (cfg.use_sw_timestamps)
 	    clock_gettime(CLOCK_TAI, &rtt->sw_tx);
@@ -344,7 +383,14 @@ void emit(config_t cfg) {
             if (cfg.duration > 0 && rdtsc() > deadline)
                 break;
         }
+
+	/* Reset length before fetching from Error Queue */
+	msg_tx.msg_controllen = sizeof(cbuf_tx);
+	msg_tx.msg_flags = 0;
 	if (recvmsg(s, &msg_tx, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {
+	    /* Reset hw_tx to ensure we are not seeing stale data */
+	    rtt->hw_tx.tv_sec = 0;
+            rtt->hw_tx.tv_nsec = 0;
             get_ts(&msg_tx, &rtt->hw_tx);
         }
 
@@ -389,6 +435,10 @@ void emit(config_t cfg) {
 				 packet_count, rtt->delta, cfg.threshold);
 			write_trace_marker(trace_msg);
 		    }
+		    if (snapshot_fd >= 0)
+			write(snapshot_fd, "1", 1);
+		    if (tracing_on_fd >= 0)
+			write(tracing_on_fd, "0", 1);
 
 		    /* exit early: threshold exceeded */
 		    keep_running = 0;
@@ -471,6 +521,23 @@ void reflect(config_t cfg) {
         /* Start timing when warmup completes, before first test packet */
         if (packet_count == cfg.warmup) {
             test_start_tsc = rdtsc();
+            if (trace_marker_fd >= 0)
+                write_trace_marker("RANT_TEST_START reflect\n");
+        }
+
+        /* Only save to log_book after warmup and if logging enabled */
+        if (packet_count >= cfg.warmup && log_book != NULL) {
+            /* Check if log capacity exceeded */
+            if (log_size >= log_capacity) {
+                fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records)\n", log_capacity);
+                fprintf(stderr, "  Stopping test to prevent buffer overflow.\n");
+                fprintf(stderr, "  Consider using -d <seconds> for shorter tests or increase capacity.\n");
+                keep_running = 0;
+                break;
+            }
+            resp = &log_book[log_size++];
+        } else {
+            resp = &warmup_record;
         }
 
         /* Reset length before fetching Ping pkt */
@@ -487,63 +554,39 @@ void reflect(config_t cfg) {
         if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
 
             /* T2_SW: Software timestamp IMMEDIATELY after recvmsg (before ANY other code) */
-            struct timespec t2_sw_immediate;
-            if (cfg.use_sw_timestamps) {
-	        clock_gettime(CLOCK_TAI, &t2_sw_immediate);
-            }
+            if (cfg.use_sw_timestamps)
+		clock_gettime(CLOCK_TAI, &resp->sw_rx);
 
             /* T2_HW: Hardware timestamp when ping is received (extract from cmsg) */
-            struct timespec t2_hw;
-            get_ts(&msg_rx, &t2_hw);
-
-	    /* NOW do application logic (pointer assignment, warmup check, etc.) */
-	    if (packet_count >= cfg.warmup && log_book != NULL) {
-	        /* Check if log capacity exceeded */
-	        if (log_size >= log_capacity) {
-	            fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records)\n", log_capacity);
-	            fprintf(stderr, "  Stopping test to prevent buffer overflow.\n");
-	            fprintf(stderr, "  Consider using -d <seconds> for shorter tests or increase capacity.\n");
-	            keep_running = 0;
-	            break;
-	        }
-	        resp = &log_book[log_size++];
-	    } else {
-	        resp = &warmup_record;
-	    }
-
-            /* Store the immediately-captured timestamps */
-            resp->sw_rx = t2_sw_immediate;
-            resp->hw_rx = t2_hw;
-
-	    /* Reset length before fetching from Error Queue */
-    	    msg_tx.msg_controllen = sizeof(cbuf_tx); 
-            msg_tx.msg_flags = 0;
-
-	    /* Reset hw_tx to ensure we are not seeing stale data */
-	    resp->hw_tx.tv_sec = 0;
-            resp->hw_tx.tv_nsec = 0;
+            get_ts(&msg_rx, &resp->hw_rx);
 
             /* T3_SW: Software timestamp when pong is sent */
-            if (cfg.use_sw_timestamps) {
+            if (cfg.use_sw_timestamps)
                 clock_gettime(CLOCK_TAI, &resp->sw_tx);
-            }
 
 	    /* Send Pong */
             sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
 
-            /* T3_HW: Hardware timestamp when pong is sent */
             while (poll(&pfd_tx, 1, 0) <= 0 && keep_running) {
                 if (cfg.duration > 0 && rdtsc() > deadline)
                     break;
             }
+
+            /* T3_HW: Hardware timestamp when pong leaves NIC */
+	    /* Reset length before fetching from Error Queue */
+	    msg_tx.msg_controllen = sizeof(cbuf_tx);
+	    msg_tx.msg_flags = 0;
             if (recvmsg(s, &msg_tx, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {
+		/* Reset hw_tx to ensure we are not seeing stale data */
+	        resp->hw_tx.tv_sec = 0;
+                resp->hw_tx.tv_nsec = 0;
                 get_ts(&msg_tx, &resp->hw_tx);
             }
 
-	    /* Calculate Response latency (T3_HW - T2_HW) */
+            /* Calculate Response latency: T3_HW - T2_HW */
             resp->delta =
-		    (resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
-                    (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
+		(resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
+                (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
 
             packet_count++;
             if (packet_count > cfg.warmup) {
@@ -561,11 +604,15 @@ void reflect(config_t cfg) {
 				 packet_count, resp->delta, cfg.threshold);
 			write_trace_marker(trace_msg);
 		    }
+		    if (snapshot_fd >= 0)
+			write(snapshot_fd, "1", 1);
+		    if (tracing_on_fd >= 0)
+			write(tracing_on_fd, "0", 1);
 
 		    /* exit early: threshold exceeded */
 		    keep_running = 0;
 		    break;
-		}
+	        }
             }
         }
 
@@ -637,7 +684,8 @@ void print_usage(const char *progname) {
     printf("Optional:\n");
     printf("  -a, --address <ip>            Server IP address (client mode)\n");
     printf("  -t, --threshold <us>          Stop when latency exceeds threshold (microseconds, after warmup)\n");
-    printf("  -T, --trace-marker            Enable kernel trace_marker integration (requires -t)\n");
+    printf("  -T, --trace-marker            Enable kernel trace_marker integration (stops tracing on threshold)\n");
+    printf("  -S, --snapshot                Take ftrace snapshot on threshold (read /sys/kernel/tracing/snapshot)\n");
     printf("  -d, --duration <sec>          Test duration in seconds\n");
     printf("  -w, --warmup <pkts>           Number of warmup packets to discard\n");
     printf("  -s, --sw-timestamps           Collect software timestamps\n");
@@ -667,7 +715,8 @@ int main(int argc, char **argv) {
 	.busy_poll_budget = 0,
 	.prefer_busy_poll = 0,
 	.use_hugepages = 0,
-	.enable_trace_marker = 0
+	.enable_trace_marker = 0,
+	.enable_snapshot = 0
     };
     
     bucket_max = DEFAULT_BUCKET_MAX;
@@ -683,6 +732,7 @@ int main(int argc, char **argv) {
         {"address",          required_argument, 0, 'a'},
         {"threshold",        required_argument, 0, 't'},
         {"trace-marker",     no_argument,       0, 'T'},
+        {"snapshot",         no_argument,       0, 'S'},
         {"sw-timestamps",    no_argument,       0, 's'},
         {"histogram",        no_argument,       0, 'H'},
         {"log",              required_argument, 0, 'l'},
@@ -694,7 +744,7 @@ int main(int argc, char **argv) {
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TsHl:GB:Ph", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSsHl:GB:Ph", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -756,6 +806,9 @@ int main(int argc, char **argv) {
             case 'T':  // --trace-marker
                 config.enable_trace_marker = 1;
                 break;
+	    case 'S':  // --snapshot
+		config.enable_snapshot = 1;
+		break;
             case 's':
                 config.use_sw_timestamps = 1;
                 break;
@@ -792,9 +845,18 @@ int main(int argc, char **argv) {
 	return 1;
     }
 
-    /* Open trace_marker if both threshold and trace-marker flag are specified */
-    if (config.threshold > 0 && config.enable_trace_marker) {
+    /* Snapshot implies trace-marker (needs trace_marker + tracing_on) */
+    if (config.enable_snapshot)
+        config.enable_trace_marker = 1;
+
+    /* Open trace_marker if trace-marker flag is specified */
+    if (config.enable_trace_marker) {
         open_trace_marker();
+    }
+
+    /* Open snapshot fd if snapshot flag is specified */
+    if (config.enable_snapshot) {
+        open_snapshot();
     }
 
     /* Only allocate log_book if --log is specified */
