@@ -516,18 +516,101 @@ void reflect(config_t cfg) {
     struct record warmup_record;  /* Temporary storage for warmup packets */
     struct record *resp;
 
+    /* Allocate record for first packet */
+    if (packet_count >= cfg.warmup && log_book != NULL) {
+        resp = &log_book[log_size++];
+    } else {
+        resp = &warmup_record;
+    }
+
+    /* Bootstrap: receive first ping and send first pong.
+     * The main loop collects the TX timestamp for the PREVIOUS pong
+     * when the NEXT ping arrives, so the first ping/pong is handled here. */
+    msg_rx.msg_controllen = sizeof(cbuf_rx);
+    msg_rx.msg_flags = 0;
+    while (poll(&pfd_rx, 1, 0) <= 0 && keep_running) {
+        if (cfg.duration > 0 && rdtsc() > deadline)
+            break;
+    }
+    if (!keep_running || (cfg.duration > 0 && rdtsc() > deadline))
+        goto done;
+
+    if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
+        if (cfg.use_sw_timestamps)
+            clock_gettime(CLOCK_TAI, &resp->sw_rx);
+        get_ts(&msg_rx, &resp->hw_rx);
+        if (cfg.use_sw_timestamps)
+            clock_gettime(CLOCK_TAI, &resp->sw_tx);
+        sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
+    }
+
+    /* Main loop: deferred TX timestamp with single poll.
+     * poll(POLLIN) may also wake on POLLERR (TX completion ready).
+     * When POLLERR fires without POLLIN, collect ERRQUEUE and keep polling.
+     * When POLLIN fires, collect ERRQUEUE (if ready) then receive ping. */
     while (keep_running) {
 
-        /* Start timing when warmup completes, before first test packet */
-        if (packet_count == cfg.warmup) {
-            test_start_tsc = rdtsc();
-            if (trace_marker_fd >= 0)
-                write_trace_marker("RANT_TEST_START reflect\n");
+        /* Wait for next ping */
+        msg_rx.msg_controllen = sizeof(cbuf_rx);
+        msg_rx.msg_flags = 0;
+        while (poll(&pfd_rx, 1, 0) <= 0 && keep_running) {
+            if (cfg.duration > 0 && rdtsc() > deadline)
+                break;
+        }
+        if (!keep_running || (cfg.duration > 0 && rdtsc() > deadline))
+            break;
+
+        /* Always try ERRQUEUE — TX completion may or may not be ready */
+        msg_tx.msg_controllen = sizeof(cbuf_tx);
+        msg_tx.msg_flags = 0;
+        if (recvmsg(s, &msg_tx, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {
+            get_ts(&msg_tx, &resp->hw_tx);
+
+            /* Calculate Response latency for PREVIOUS packet: T3_HW - T2_HW */
+            resp->delta =
+                (resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
+                (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
+
+            packet_count++;
+
+            /* Start timing when warmup completes */
+            if (packet_count == cfg.warmup) {
+                test_start_tsc = rdtsc();
+                if (trace_marker_fd >= 0)
+                    write_trace_marker("RANT_TEST_START reflect\n");
+            }
+
+            if (packet_count > cfg.warmup) {
+                histogram_record(resp->delta, cfg);
+
+                if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
+                    printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
+                           resp->delta, cfg.threshold);
+
+                    if (trace_marker_fd >= 0) {
+                        char trace_msg[256];
+                        snprintf(trace_msg, sizeof(trace_msg),
+                                 "rant: Response threshold exceeded: seq=%"PRIu64" latency=%"PRIu64"ns threshold=%"PRIu64"ns\n",
+                                 packet_count, resp->delta, cfg.threshold);
+                        write_trace_marker(trace_msg);
+                    }
+                    if (snapshot_fd >= 0)
+                        write(snapshot_fd, "1", 1);
+                    if (tracing_on_fd >= 0)
+                        write(tracing_on_fd, "0", 1);
+
+                    keep_running = 0;
+                    break;
+                }
+            }
         }
 
-        /* Only save to log_book after warmup and if logging enabled */
+        /* If no POLLIN, poll woke on POLLERR only — loop back to wait for ping */
+        if (!(pfd_rx.revents & POLLIN))
+            continue;
+
+        /* Allocate record for THIS packet */
         if (packet_count >= cfg.warmup && log_book != NULL) {
-            /* Check if log capacity exceeded */
             if (log_size >= log_capacity) {
                 fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records)\n", log_capacity);
                 fprintf(stderr, "  Stopping test to prevent buffer overflow.\n");
@@ -540,87 +623,21 @@ void reflect(config_t cfg) {
             resp = &warmup_record;
         }
 
-        /* Reset length before fetching Ping pkt */
-    	msg_rx.msg_controllen = sizeof(cbuf_rx);
-        msg_rx.msg_flags = 0;
-
-	/* Wait for Ping */
-        while (poll(&pfd_rx, 1, 0) <= 0 && keep_running) {
-            if (cfg.duration > 0 && rdtsc() > deadline)
-                break;
-	}
-
-        /* Packet arrived: Receive Ping & Get RX Timestamp */
+        /* Receive THIS ping & send pong */
         if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
-
-            /* T2_SW: Software timestamp IMMEDIATELY after recvmsg (before ANY other code) */
             if (cfg.use_sw_timestamps)
-		clock_gettime(CLOCK_TAI, &resp->sw_rx);
-
-            /* T2_HW: Hardware timestamp when ping is received (extract from cmsg) */
+                clock_gettime(CLOCK_TAI, &resp->sw_rx);
             get_ts(&msg_rx, &resp->hw_rx);
-
-            /* T3_SW: Software timestamp when pong is sent */
             if (cfg.use_sw_timestamps)
                 clock_gettime(CLOCK_TAI, &resp->sw_tx);
-
-	    /* Send Pong */
             sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
-
-            while (poll(&pfd_tx, 1, 0) <= 0 && keep_running) {
-                if (cfg.duration > 0 && rdtsc() > deadline)
-                    break;
-            }
-
-            /* T3_HW: Hardware timestamp when pong leaves NIC */
-	    /* Reset length before fetching from Error Queue */
-	    msg_tx.msg_controllen = sizeof(cbuf_tx);
-	    msg_tx.msg_flags = 0;
-            if (recvmsg(s, &msg_tx, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {
-		/* Reset hw_tx to ensure we are not seeing stale data */
-	        resp->hw_tx.tv_sec = 0;
-                resp->hw_tx.tv_nsec = 0;
-                get_ts(&msg_tx, &resp->hw_tx);
-            }
-
-            /* Calculate Response latency: T3_HW - T2_HW */
-            resp->delta =
-		(resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
-                (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
-
-            packet_count++;
-            if (packet_count > cfg.warmup) {
-	        histogram_record(resp->delta, cfg);
-
-		if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
-		    printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
-			   resp->delta, cfg.threshold);
-
-		    /* Write to trace_marker for kernel tracing correlation */
-		    if (trace_marker_fd >= 0) {
-			char trace_msg[256];
-			snprintf(trace_msg, sizeof(trace_msg),
-				 "rant: Response threshold exceeded: seq=%"PRIu64" latency=%"PRIu64"ns threshold=%"PRIu64"ns\n",
-				 packet_count, resp->delta, cfg.threshold);
-			write_trace_marker(trace_msg);
-		    }
-		    if (snapshot_fd >= 0)
-			write(snapshot_fd, "1", 1);
-		    if (tracing_on_fd >= 0)
-			write(tracing_on_fd, "0", 1);
-
-		    /* exit early: threshold exceeded */
-		    keep_running = 0;
-		    break;
-	        }
-            }
         }
 
-	/* check if duration timed out */
         if (cfg.duration > 0 && rdtsc() > deadline)
             break;
     }
 
+done:;
     uint64_t duration_cycles = rdtsc() - test_start_tsc;
     printf("Test is complete. Duration: %.2f s\n", (double)duration_cycles / cycles_per_sec);
 }
