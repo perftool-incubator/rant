@@ -78,6 +78,8 @@ size_t log_size = 0;
 size_t log_capacity = 0;  // Calculated based on test duration
 size_t log_book_bytes = 0;  // Track allocation size for munmap
 int using_hugepages = 0;  // Track if hugepages were successfully allocated
+int circular_log = 0;  // Circular buffer mode (when --snapshot + --log)
+#define SNAPSHOT_LOG_CAPACITY 500000  // ~10 seconds at 50K packets/sec
 volatile sig_atomic_t keep_running = 1;
 
 /* Trace marker file descriptor for kernel tracing integration */
@@ -358,15 +360,18 @@ void emit(config_t cfg) {
 
         /* Only save to log_book after warmup and if logging enabled */
         if (packet_count >= cfg.warmup && log_book != NULL) {
-            /* Check if log capacity exceeded */
-            if (log_size >= log_capacity) {
+            if (circular_log) {
+                rtt = &log_book[log_size % log_capacity];
+            } else if (log_size >= log_capacity) {
                 fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records)\n", log_capacity);
                 fprintf(stderr, "  Stopping test to prevent buffer overflow.\n");
                 fprintf(stderr, "  Consider using -d <seconds> for shorter tests or increase capacity.\n");
                 keep_running = 0;
                 break;
+            } else {
+                rtt = &log_book[log_size];
             }
-            rtt = &log_book[log_size++];
+            log_size++;
         } else {
             rtt = &warmup_record;
         }
@@ -426,6 +431,18 @@ void emit(config_t cfg) {
 		if (cfg.threshold > 0 && rtt->delta > cfg.threshold) {
 		    printf("Round-Trip latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
 			   rtt->delta, cfg.threshold);
+		    printf("  T1_HW (NIC tx):  %ld.%09ld\n", rtt->hw_tx.tv_sec, rtt->hw_tx.tv_nsec);
+		    printf("  T4_HW (NIC rx):  %ld.%09ld\n", rtt->hw_rx.tv_sec, rtt->hw_rx.tv_nsec);
+		    if (cfg.use_sw_timestamps) {
+			int64_t tx_delay = (rtt->hw_tx.tv_sec - rtt->sw_tx.tv_sec) * 1000000000LL +
+					   (rtt->hw_tx.tv_nsec - rtt->sw_tx.tv_nsec);
+			int64_t rx_delay = (rtt->sw_rx.tv_sec - rtt->hw_rx.tv_sec) * 1000000000LL +
+					   (rtt->sw_rx.tv_nsec - rtt->hw_rx.tv_nsec);
+			printf("  T1_SW (app tx):  %ld.%09ld\n", rtt->sw_tx.tv_sec, rtt->sw_tx.tv_nsec);
+			printf("  T4_SW (app rx):  %ld.%09ld\n", rtt->sw_rx.tv_sec, rtt->sw_rx.tv_nsec);
+			printf("  App-to-NIC (T1_HW - T1_SW): %"PRId64" ns\n", tx_delay);
+			printf("  NIC-to-app (T4_SW - T4_HW): %"PRId64" ns\n", rx_delay);
+		    }
 
 		    /* Write to trace_marker for kernel tracing correlation */
 		    if (trace_marker_fd >= 0) {
@@ -518,7 +535,8 @@ void reflect(config_t cfg) {
 
     /* Allocate record for first packet */
     if (packet_count >= cfg.warmup && log_book != NULL) {
-        resp = &log_book[log_size++];
+        resp = &log_book[circular_log ? (log_size % log_capacity) : log_size];
+        log_size++;
     } else {
         resp = &warmup_record;
     }
@@ -586,6 +604,21 @@ void reflect(config_t cfg) {
                 if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
                     printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
                            resp->delta, cfg.threshold);
+                    printf("  T2_HW (NIC rx):  %ld.%09ld\n", resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec);
+                    printf("  T3_HW (NIC tx):  %ld.%09ld\n", resp->hw_tx.tv_sec, resp->hw_tx.tv_nsec);
+                    if (cfg.use_sw_timestamps) {
+                        int64_t rx_delay = (resp->sw_rx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
+                                           (resp->sw_rx.tv_nsec - resp->hw_rx.tv_nsec);
+                        int64_t tx_delay = (resp->hw_tx.tv_sec - resp->sw_tx.tv_sec) * 1000000000LL +
+                                           (resp->hw_tx.tv_nsec - resp->sw_tx.tv_nsec);
+                        printf("  T2_SW (app rx):  %ld.%09ld\n", resp->sw_rx.tv_sec, resp->sw_rx.tv_nsec);
+                        printf("  T3_SW (app tx):  %ld.%09ld\n", resp->sw_tx.tv_sec, resp->sw_tx.tv_nsec);
+                        printf("  NIC-to-app (T2_SW - T2_HW): %"PRId64" ns\n", rx_delay);
+                        printf("  App-to-NIC (T3_HW - T3_SW): %"PRId64" ns\n", tx_delay);
+                        printf("  App processing (T3_SW - T2_SW): %"PRId64" ns\n",
+                            (resp->sw_tx.tv_sec - resp->sw_rx.tv_sec) * 1000000000LL +
+                            (resp->sw_tx.tv_nsec - resp->sw_rx.tv_nsec));
+                    }
 
                     if (trace_marker_fd >= 0) {
                         char trace_msg[256];
@@ -611,14 +644,18 @@ void reflect(config_t cfg) {
 
         /* Allocate record for THIS packet */
         if (packet_count >= cfg.warmup && log_book != NULL) {
-            if (log_size >= log_capacity) {
+            if (circular_log) {
+                resp = &log_book[log_size % log_capacity];
+            } else if (log_size >= log_capacity) {
                 fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records)\n", log_capacity);
                 fprintf(stderr, "  Stopping test to prevent buffer overflow.\n");
                 fprintf(stderr, "  Consider using -d <seconds> for shorter tests or increase capacity.\n");
                 keep_running = 0;
                 break;
+            } else {
+                resp = &log_book[log_size];
             }
-            resp = &log_book[log_size++];
+            log_size++;
         } else {
             resp = &warmup_record;
         }
@@ -652,9 +689,14 @@ void roundtrip_log(const char *filename) {
         }
         fputc('\n', fp);
 
-        for (long i = 0; i < log_size; i++) {
-            fprintf(fp, "%10ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %15lld\n",
-                i,
+        size_t count = (circular_log && log_size > log_capacity) ? log_capacity : log_size;
+        size_t start = (circular_log && log_size > log_capacity) ? (log_size % log_capacity) : 0;
+        size_t seq_base = (log_size > count) ? (log_size - count) : 0;
+
+        for (size_t n = 0; n < count; n++) {
+            size_t i = (start + n) % log_capacity;
+            fprintf(fp, "%10zu %20ld.%09ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %15lld\n",
+                seq_base + n,
                 log_book[i].sw_tx.tv_sec, log_book[i].sw_tx.tv_nsec,
                 log_book[i].hw_tx.tv_sec, log_book[i].hw_tx.tv_nsec,
                 log_book[i].hw_rx.tv_sec, log_book[i].hw_rx.tv_nsec,
@@ -663,7 +705,6 @@ void roundtrip_log(const char *filename) {
         }
     }
     fclose(fp);
-    return; 
 }
 
 void show_stats() {
@@ -681,9 +722,14 @@ void response_log(const char *filename) {
         }
         fputc('\n', fp);
 
-        for (long i = 0; i < log_size; i++) {
-            fprintf(fp, "%10ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %15lld\n",
-                i,
+        size_t count = (circular_log && log_size > log_capacity) ? log_capacity : log_size;
+        size_t start = (circular_log && log_size > log_capacity) ? (log_size % log_capacity) : 0;
+        size_t seq_base = (log_size > count) ? (log_size - count) : 0;
+
+        for (size_t n = 0; n < count; n++) {
+            size_t i = (start + n) % log_capacity;
+            fprintf(fp, "%10zu %20ld.%09ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %15lld\n",
+                seq_base + n,
                 log_book[i].hw_rx.tv_sec, log_book[i].hw_rx.tv_nsec,
                 log_book[i].sw_rx.tv_sec, log_book[i].sw_rx.tv_nsec,
                 log_book[i].sw_tx.tv_sec, log_book[i].sw_tx.tv_nsec,
@@ -702,7 +748,9 @@ void print_usage(const char *progname) {
     printf("  -a, --address <ip>            Server IP address (client mode)\n");
     printf("  -t, --threshold <us>          Stop when latency exceeds threshold (microseconds, after warmup)\n");
     printf("  -T, --trace-marker            Enable kernel trace_marker integration (stops tracing on threshold)\n");
-    printf("  -S, --snapshot                Take ftrace snapshot on threshold (read /sys/kernel/tracing/snapshot)\n");
+    printf("  -S, --snapshot                Take ftrace snapshot on threshold breach.\n");
+    printf("                                  With --log: uses circular buffer (~10s, 36MB)\n");
+    printf("                                  Trace setup: echo 16384 > /sys/.../instances/rant/buffer_size_kb\n");
     printf("  -d, --duration <sec>          Test duration in seconds\n");
     printf("  -w, --warmup <pkts>           Number of warmup packets to discard\n");
     printf("  -s, --sw-timestamps           Collect software timestamps\n");
@@ -882,6 +930,22 @@ int main(int argc, char **argv) {
         log_book = NULL;
         log_capacity = 0;
         log_book_bytes = 0;
+    } else if (config.enable_snapshot) {
+        /* Snapshot mode: circular buffer with ~10 seconds of packets */
+        circular_log = 1;
+        log_capacity = SNAPSHOT_LOG_CAPACITY;
+        log_book_bytes = log_capacity * sizeof(struct record);
+
+        fprintf(stderr, "Snapshot mode: circular log buffer of %zu records (~10s, %.1f MB)\n",
+            log_capacity, log_book_bytes / (1024.0 * 1024.0));
+        fprintf(stderr, "  Recommended trace buffer: echo 16384 > /sys/kernel/tracing/instances/rant/buffer_size_kb\n\n");
+
+        log_book = calloc(log_capacity, sizeof(struct record));
+        if (log_book == NULL) {
+            perror("calloc failed");
+            return 1;
+        }
+        using_hugepages = 0;
     } else {
         /* Calculate log_capacity based on test duration or default to 1 hour equivalent */
         uint64_t duration_for_capacity;
