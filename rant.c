@@ -47,6 +47,7 @@ typedef struct {
     int use_hugepages;
     int enable_trace_marker;
     int enable_snapshot;
+    int verbose;
 } config_t;
 
 uint64_t *histogram = NULL;
@@ -80,6 +81,7 @@ size_t log_book_bytes = 0;  // Track allocation size for munmap
 int using_hugepages = 0;  // Track if hugepages were successfully allocated
 int circular_log = 0;  // Circular buffer mode (when --snapshot + --log)
 #define SNAPSHOT_LOG_CAPACITY 500000  // ~10 seconds at 50K packets/sec
+int verbose = 0;  // Verbose output mode
 volatile sig_atomic_t keep_running = 1;
 
 /* Trace marker file descriptor for kernel tracing integration */
@@ -146,8 +148,8 @@ void open_trace_marker() {
         fprintf(stderr, "Warning: Cannot open trace_marker: %s\n", strerror(errno));
         fprintf(stderr, "  Kernel tracing integration disabled.\n");
         fprintf(stderr, "  Try: sudo mount -t tracefs nodev /sys/kernel/tracing\n\n");
-    } else {
-        fprintf(stderr, "Trace marker enabled for kernel tracing integration\n\n");
+    } else if (verbose) {
+        fprintf(stderr, "✅ Trace marker enabled\n");
     }
 
     tracing_on_fd = open_tracefs("tracing_on", O_WRONLY);
@@ -163,8 +165,8 @@ void open_snapshot() {
     if (snapshot_fd < 0) {
         fprintf(stderr, "Warning: Cannot open snapshot: %s\n", strerror(errno));
         fprintf(stderr, "  Allocate snapshot buffer first: echo 1 > /sys/kernel/tracing/instances/rant/snapshot\n");
-    } else {
-        fprintf(stderr, "Trace snapshot enabled\n");
+    } else if (verbose) {
+        fprintf(stderr, "✅ Trace snapshot enabled\n");
     }
 }
 
@@ -341,13 +343,22 @@ void emit(config_t cfg) {
     msg_tx.msg_control = cbuf_tx;
 
 
+    if (verbose)
+        fprintf(stderr, "\n⏱️  Calibrating RDTSC...\n");
     uint64_t cycles_per_sec = calibrate_rdtsc();
+    if (verbose)
+        fprintf(stderr, "✅ RDTSC: %"PRIu64" cycles/sec\n", cycles_per_sec);
     uint64_t start_tsc = rdtsc();
     uint64_t test_start_tsc = start_tsc;
     uint64_t deadline = cfg.duration > 0 ? start_tsc + (cfg.duration * cycles_per_sec): 0;
     uint64_t packet_count = 0;
     struct record warmup_record;  /* Temporary storage for warmup packets */
     struct record *rtt;
+
+    if (verbose && cfg.warmup > 0)
+        fprintf(stderr, "\n🔄 Warmup: sending %"PRIu64" packets...\n", cfg.warmup);
+    else if (verbose)
+        fprintf(stderr, "\n🚀 Test started\n");
 
     while (keep_running) {
 
@@ -356,6 +367,8 @@ void emit(config_t cfg) {
             test_start_tsc = rdtsc();
             if (trace_marker_fd >= 0)
                 write_trace_marker("RANT_TEST_START emit\n");
+            if (verbose && cfg.warmup > 0)
+                fprintf(stderr, "✅ Warmup complete, test started\n");
         }
 
         /* Only save to log_book after warmup and if logging enabled */
@@ -525,13 +538,20 @@ void reflect(config_t cfg) {
     msg_tx.msg_iov = &iov_tx; msg_tx.msg_iovlen = 1;
     msg_tx.msg_control = cbuf_tx;
 
+    if (verbose)
+        fprintf(stderr, "\n⏱️  Calibrating RDTSC...\n");
     uint64_t cycles_per_sec = calibrate_rdtsc();
+    if (verbose)
+        fprintf(stderr, "✅ RDTSC: %"PRIu64" cycles/sec\n", cycles_per_sec);
     uint64_t start_tsc = rdtsc();
     uint64_t test_start_tsc = start_tsc;
     uint64_t deadline = cfg.duration > 0 ? start_tsc + (cfg.duration * cycles_per_sec): 0;
     uint64_t packet_count = 0;
     struct record warmup_record;  /* Temporary storage for warmup packets */
     struct record *resp;
+
+    if (verbose)
+        fprintf(stderr, "\n⏳ Waiting for first packet...\n");
 
     /* Allocate record for first packet */
     if (packet_count >= cfg.warmup && log_book != NULL) {
@@ -596,6 +616,10 @@ void reflect(config_t cfg) {
                 test_start_tsc = rdtsc();
                 if (trace_marker_fd >= 0)
                     write_trace_marker("RANT_TEST_START reflect\n");
+                if (verbose && cfg.warmup > 0)
+                    fprintf(stderr, "✅ Warmup complete (%"PRIu64" packets), test started\n", cfg.warmup);
+                else if (verbose)
+                    fprintf(stderr, "🚀 Test started\n");
             }
 
             if (packet_count > cfg.warmup) {
@@ -761,6 +785,7 @@ void print_usage(const char *progname) {
     printf("  -G, --hugepages               Use hugepages for memory allocation (requires system config)\n");
     printf("  -B, --budget <budget>         Set SO_BUSY_POLL_BUDGET (NAPI poll budget)\n");
     printf("  -P, --prefer-busypoll         Set SO_PREFER_BUSY_POLL (prefer busy poll over interrupt)\n");
+    printf("  -v, --verbose                 Verbose output (show config, allocation, progress)\n");
     printf("  -h, --help                    Show this help message\n");
 }
 
@@ -781,7 +806,8 @@ int main(int argc, char **argv) {
 	.prefer_busy_poll = 0,
 	.use_hugepages = 0,
 	.enable_trace_marker = 0,
-	.enable_snapshot = 0
+	.enable_snapshot = 0,
+	.verbose = 0
     };
     
     bucket_max = DEFAULT_BUCKET_MAX;
@@ -804,12 +830,13 @@ int main(int argc, char **argv) {
         {"hugepages",        no_argument,       0, 'G'},
         {"budget",           required_argument, 0, 'B'},
         {"prefer-busypoll",  no_argument,       0, 'P'},
+        {"verbose",          no_argument,       0, 'v'},
         {"help",             no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSsHl:GB:Ph", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSsHl:GB:Pvh", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -896,6 +923,9 @@ int main(int argc, char **argv) {
 	    case 'P':  // --prefer-busypoll
 		config.prefer_busy_poll = 1;
 		break;
+	    case 'v':  // --verbose
+		config.verbose = 1;
+		break;
 	    case 'h':
 		print_usage(argv[0]);
 		return 0;
@@ -910,9 +940,43 @@ int main(int argc, char **argv) {
 	return 1;
     }
 
+    /* Set global verbose flag for functions that don't take config */
+    verbose = config.verbose;
+
     /* Snapshot implies trace-marker (needs trace_marker + tracing_on) */
     if (config.enable_snapshot)
         config.enable_trace_marker = 1;
+
+    /* Print test configuration summary */
+    if (verbose) {
+        fprintf(stderr, "\n📋 Test Configuration\n");
+        fprintf(stderr, "  Mode:           %s\n", config.ip ? "Emit (client)" : "Reflect (server)");
+        fprintf(stderr, "  Interface:      %s\n", config.iface);
+        if (config.ip)
+            fprintf(stderr, "  Server address: %s\n", config.ip);
+        fprintf(stderr, "  Duration:       %s", config.duration > 0 ? "" : "unlimited (until Ctrl-C");
+        if (config.duration > 0)
+            fprintf(stderr, "%"PRIu64" seconds", config.duration);
+        else
+            fprintf(stderr, ")");
+        fprintf(stderr, "\n");
+        fprintf(stderr, "  Warmup:         %"PRIu64" packets\n", config.warmup);
+        if (config.threshold > 0)
+            fprintf(stderr, "  Threshold:      %"PRIu64" us (stop on breach)\n", config.threshold / 1000);
+        fprintf(stderr, "  SW timestamps:  %s\n", config.use_sw_timestamps ? "yes" : "no");
+        fprintf(stderr, "  Histogram:      %s (overflow: %"PRIu64" us, bucket: %"PRIu32" us)\n",
+            config.show_histogram ? "yes" : "no",
+            config.bucket_overflow / 1000, config.bucket_size / 1000);
+        if (config.log_file)
+            fprintf(stderr, "  Log file:       %s\n", config.log_file);
+        fprintf(stderr, "  Trace marker:   %s\n", config.enable_trace_marker ? "yes" : "no");
+        fprintf(stderr, "  Snapshot:       %s\n", config.enable_snapshot ? "yes" : "no");
+        fprintf(stderr, "  Hugepages:      %s\n", config.use_hugepages ? "yes" : "no");
+        if (config.busy_poll_budget > 0)
+            fprintf(stderr, "  Busy poll:      budget=%d, prefer=%s\n",
+                config.busy_poll_budget, config.prefer_busy_poll ? "yes" : "no");
+        fprintf(stderr, "\n");
+    }
 
     /* Open trace_marker if trace-marker flag is specified */
     if (config.enable_trace_marker) {
@@ -926,7 +990,6 @@ int main(int argc, char **argv) {
 
     /* Only allocate log_book if --log is specified */
     if (config.log_file == NULL) {
-        fprintf(stderr, "No --log file specified, logging disabled\n\n");
         log_book = NULL;
         log_capacity = 0;
         log_book_bytes = 0;
@@ -936,9 +999,9 @@ int main(int argc, char **argv) {
         log_capacity = SNAPSHOT_LOG_CAPACITY;
         log_book_bytes = log_capacity * sizeof(struct record);
 
-        fprintf(stderr, "Snapshot mode: circular log buffer of %zu records (~10s, %.1f MB)\n",
-            log_capacity, log_book_bytes / (1024.0 * 1024.0));
-        fprintf(stderr, "  Recommended trace buffer: echo 16384 > /sys/kernel/tracing/instances/rant/buffer_size_kb\n\n");
+        if (verbose)
+            fprintf(stderr, "📦 Log: circular buffer %zu records (~10s, %.1f MB)\n",
+                log_capacity, log_book_bytes / (1024.0 * 1024.0));
 
         log_book = calloc(log_capacity, sizeof(struct record));
         if (log_book == NULL) {
@@ -963,9 +1026,10 @@ int main(int argc, char **argv) {
 
         size_t required_gb = log_book_bytes / (1024ULL * 1024 * 1024);
 
-        fprintf(stderr, "Allocating log memory for ~%lu seconds (%.1f hours): %zu records (%.2f GB)\n",
-            duration_for_capacity, duration_for_capacity / 3600.0, log_capacity,
-            log_book_bytes / (1024.0 * 1024.0 * 1024.0));
+        if (verbose)
+            fprintf(stderr, "📦 Log: allocating for ~%lu seconds: %zu records (%.2f GB)\n",
+                duration_for_capacity, log_capacity,
+                log_book_bytes / (1024.0 * 1024.0 * 1024.0));
 
         /* Sanity check: warn if allocation is very large (>256 GB) */
         if (required_gb > 256) {
@@ -978,7 +1042,6 @@ int main(int argc, char **argv) {
 
         if (config.use_hugepages) {
             /* Try to allocate with hugepages */
-            fprintf(stderr, "Attempting hugepage allocation (use -G flag)...\n");
 
             /* Try 2MB hugepages first (21 = log2(2MB)) */
             log_book = mmap(NULL, log_book_bytes,
@@ -987,7 +1050,8 @@ int main(int argc, char **argv) {
                             -1, 0);
 
             if (log_book == MAP_FAILED) {
-                fprintf(stderr, "Warning: 2MB hugepages not available, trying default hugepages...\n");
+                if (verbose)
+                    fprintf(stderr, "  2MB hugepages not available, trying default...\n");
 
                 /* Try default hugepages without size specification */
                 log_book = mmap(NULL, log_book_bytes,
@@ -996,10 +1060,7 @@ int main(int argc, char **argv) {
                                 -1, 0);
 
                 if (log_book == MAP_FAILED) {
-                    fprintf(stderr, "Warning: Hugepages not available, falling back to regular allocation\n");
-                    fprintf(stderr, "  To configure hugepages, run:\n");
-                    fprintf(stderr, "    sudo sh -c 'echo %zu > /proc/sys/vm/nr_hugepages'\n",
-                            (log_book_bytes / (2 * 1024 * 1024)) + 1);
+                    fprintf(stderr, "Warning: Hugepages not available, falling back to calloc\n");
 
                     /* Fallback to calloc */
                     log_book = calloc(log_capacity, sizeof(struct record));
@@ -1008,18 +1069,15 @@ int main(int argc, char **argv) {
                         return 1;
                     }
                     using_hugepages = 0;
-                    fprintf(stderr, "Allocated %.2f GB using regular memory (calloc)\n\n",
-                            log_book_bytes / (1024.0 * 1024.0 * 1024.0));
                 } else {
                     using_hugepages = 1;
-                    fprintf(stderr, "Allocated %.2f GB using default hugepages\n\n",
-                            log_book_bytes / (1024.0 * 1024.0 * 1024.0));
                 }
             } else {
                 using_hugepages = 1;
-                fprintf(stderr, "Allocated %.2f GB using 2MB hugepages\n\n",
-                        log_book_bytes / (1024.0 * 1024.0 * 1024.0));
             }
+            if (verbose && using_hugepages)
+                fprintf(stderr, "✅ Log memory: %.2f GB (hugepages)\n",
+                        log_book_bytes / (1024.0 * 1024.0 * 1024.0));
         } else {
             /* Default: use regular calloc allocation */
             log_book = calloc(log_capacity, sizeof(struct record));
@@ -1028,9 +1086,10 @@ int main(int argc, char **argv) {
                 return 1;
             }
             using_hugepages = 0;
-            fprintf(stderr, "Allocated %.2f GB using regular memory (calloc)\n",
+        }
+        if (verbose && !using_hugepages) {
+            fprintf(stderr, "✅ Log memory: %.2f GB (calloc)\n",
                     log_book_bytes / (1024.0 * 1024.0 * 1024.0));
-            fprintf(stderr, "  Tip: Use -G flag for hugepage optimization\n\n");
         }
     }
 
@@ -1042,29 +1101,22 @@ int main(int argc, char **argv) {
     overflow_samples_bytes = overflow_capacity * sizeof(uint64_t);
 
     if (config.use_hugepages) {
-        fprintf(stderr, "Allocating overflow buffer: %.2f GB (with hugepages)\n",
-                overflow_samples_bytes / (1024.0 * 1024.0 * 1024.0));
-
         overflow_samples = mmap(NULL, overflow_samples_bytes,
                                 PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (21 << MAP_HUGE_SHIFT),
                                 -1, 0);
 
         if (overflow_samples == MAP_FAILED) {
-            /* Fallback to calloc */
             overflow_samples = calloc(overflow_capacity, sizeof(uint64_t));
             if (overflow_samples == NULL) {
                 perror("calloc overflow_samples failed");
                 return 1;
             }
             using_hugepages_overflow = 0;
-            fprintf(stderr, "Overflow buffer using regular memory (calloc)\n\n");
         } else {
             using_hugepages_overflow = 1;
-            fprintf(stderr, "Overflow buffer using 2MB hugepages\n\n");
         }
     } else {
-        /* Default: use calloc */
         overflow_samples = calloc(overflow_capacity, sizeof(uint64_t));
         if (overflow_samples == NULL) {
             perror("calloc overflow_samples failed");
@@ -1072,29 +1124,45 @@ int main(int argc, char **argv) {
         }
         using_hugepages_overflow = 0;
     }
+    if (verbose)
+        fprintf(stderr, "✅ Overflow buffer: %.2f GB (%s)\n",
+                overflow_samples_bytes / (1024.0 * 1024.0 * 1024.0),
+                using_hugepages_overflow ? "hugepages" : "calloc");
 
     /* Lock all memory pages in RAM to prevent page faults during test */
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         perror("mlockall");
-        fprintf(stderr, "Warning: Cannot lock memory in RAM. May experience page fault delays.\n");
-        fprintf(stderr, "Try: sudo setcap cap_ipc_lock=+ep %s\n", argv[0]);
-        fprintf(stderr, "Or run with: ulimit -l unlimited\n");
-        fprintf(stderr, "Continuing without memory lock...\n\n");
-    } else {
-        fprintf(stderr, "Memory locked in RAM (mlockall successful)\n\n");
+        fprintf(stderr, "Warning: Cannot lock memory. May experience page fault delays.\n");
+        fprintf(stderr, "Try: ulimit -l unlimited or sudo setcap cap_ipc_lock=+ep %s\n", argv[0]);
+    } else if (verbose) {
+        fprintf(stderr, "✅ Memory locked (mlockall)\n");
     }
+
+    if (verbose)
+        fprintf(stderr, "\n🔧 Setting up %s socket on %s...\n",
+            config.ip ? "client" : "server", config.iface);
 
     /* Reflect (server) */
     if (config.ip == NULL) {
         reflect(config);
-	if (config.log_file)
+	if (config.log_file) {
+	    if (verbose)
+	        fprintf(stderr, "\n💾 Writing log to %s (%zu records)...\n", config.log_file, log_size);
 	    response_log(config.log_file);
+	    if (verbose)
+	        fprintf(stderr, "✅ Log written\n");
+	}
     }
     /* Emit (client) */
     else {
         emit(config);
-	if (config.log_file)
+	if (config.log_file) {
+	    if (verbose)
+	        fprintf(stderr, "\n💾 Writing log to %s (%zu records)...\n", config.log_file, log_size);
 	    roundtrip_log(config.log_file);
+	    if (verbose)
+	        fprintf(stderr, "✅ Log written\n");
+	}
     }
     show_stats();
     if (config.show_histogram)

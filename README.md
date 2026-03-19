@@ -76,6 +76,7 @@ Optional:
   -G, --hugepages               Use hugepages for memory allocation
   -B, --budget <n>              Set SO_BUSY_POLL_BUDGET (NAPI poll budget)
   -P, --prefer-busypoll         Set SO_PREFER_BUSY_POLL
+  -v, --verbose                 Verbose output (config, allocation, progress)
   -h, --help                    Show help message
 ```
 
@@ -360,5 +361,3 @@ sudo ./config.sh ens7f1np1 \
 Features not yet implemented:
 * Clock drift detection and warnings
 * Hardware timestamp support verification
-* Debug/verbose logging mode
-* Quiet mode (`-q`)
