@@ -88,16 +88,21 @@ volatile sig_atomic_t keep_running = 1;
 int trace_marker_fd = -1;
 int tracing_on_fd = -1;
 int snapshot_fd = -1;
+uint64_t negative_delta_count = 0;
 
 void handle_sig(int sig) {
     keep_running = 0;
 }
 
-void get_ts(struct msghdr *msg, struct timespec *ts) {
+void get_ts(struct msghdr *msg, struct timespec *hw_ts, struct timespec *sw_ts) {
     struct cmsghdr *cmsg;
-    for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg))
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING)
-            *ts = ((struct timespec *)CMSG_DATA(cmsg))[2];
+    for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
+            struct timespec *stamps = (struct timespec *)CMSG_DATA(cmsg);
+            if (hw_ts) *hw_ts = stamps[2];  /* RAW_HARDWARE (PHC clock) */
+            if (sw_ts) *sw_ts = stamps[0];  /* SOFTWARE (CLOCK_REALTIME) */
+        }
+    }
 }
 
 static inline uint64_t rdtsc(void) {
@@ -302,7 +307,8 @@ void emit(config_t cfg) {
     struct hwtstamp_config hw_cfg = { .tx_type = HWTSTAMP_TX_ON, .rx_filter = HWTSTAMP_FILTER_ALL };
     ifr.ifr_data = (char *)&hw_cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
 
-    int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
+    int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE
+              | SOF_TIMESTAMPING_SOFTWARE | SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_RX_SOFTWARE;
     setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
 
     /* Set busy poll socket options if configured */
@@ -365,8 +371,15 @@ void emit(config_t cfg) {
         /* Start timing when warmup completes, before first test packet */
         if (packet_count == cfg.warmup) {
             test_start_tsc = rdtsc();
-            if (trace_marker_fd >= 0)
-                write_trace_marker("RANT_TEST_START emit\n");
+            if (trace_marker_fd >= 0) {
+                char marker[128];
+                struct timespec now;
+                clock_gettime(CLOCK_TAI, &now);
+                snprintf(marker, sizeof(marker),
+                    "RANT_TEST_START emit sys=%ld.%09ld\n",
+                    now.tv_sec, now.tv_nsec);
+                write_trace_marker(marker);
+            }
             if (verbose && cfg.warmup > 0)
                 fprintf(stderr, "✅ Warmup complete, test started\n");
         }
@@ -389,14 +402,14 @@ void emit(config_t cfg) {
             rtt = &warmup_record;
         }
 
-	/* T1_SW: Software timestamp when ping is sent */
+	/* T1_SW: Software timestamp before sendto */
 	if (cfg.use_sw_timestamps)
-	    clock_gettime(CLOCK_TAI, &rtt->sw_tx);
+	    clock_gettime(CLOCK_REALTIME, &rtt->sw_tx);
 
 	/* Send Ping */
 	sendto(s, buf_tx, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
 
-        /* T1_HW: Hardware timestamp when ping in sent */
+        /* T1_HW: Hardware timestamp when ping is sent */
         while (poll(&pfd_tx, 1, 0) <= 0 && keep_running) {
             if (cfg.duration > 0 && rdtsc() > deadline)
                 break;
@@ -409,7 +422,7 @@ void emit(config_t cfg) {
 	    /* Reset hw_tx to ensure we are not seeing stale data */
 	    rtt->hw_tx.tv_sec = 0;
             rtt->hw_tx.tv_nsec = 0;
-            get_ts(&msg_tx, &rtt->hw_tx);
+            get_ts(&msg_tx, &rtt->hw_tx, NULL);
         }
 
         /* Reset length before fetching the response */
@@ -425,17 +438,16 @@ void emit(config_t cfg) {
         /* Packet arrived: Receive Pong & Get RX Timestamp */
         if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
 
-            /* T4_SW: Software timestamp IMMEDIATELY after recvmsg (before ANY other code) */
-            if (cfg.use_sw_timestamps)
-		clock_gettime(CLOCK_TAI, &rtt->sw_rx);
-
-            /* T4_HW: Hardware timestamp when pong is received  */
-            get_ts(&msg_rx, &rtt->hw_rx);
+            /* T4_HW + T4_SW: extract both from cmsg */
+            get_ts(&msg_rx, &rtt->hw_rx,
+                   cfg.use_sw_timestamps ? &rtt->sw_rx : NULL);
 
             /* Calculate Round Trip Time latency: T4_HW - T1_HW */
-            rtt->delta =
+            int64_t signed_rtt =
 		    (rtt->hw_rx.tv_sec - rtt->hw_tx.tv_sec) * 1000000000LL +
                     (rtt->hw_rx.tv_nsec - rtt->hw_tx.tv_nsec);
+            if (signed_rtt < 0) { negative_delta_count++; signed_rtt = 0; }
+            rtt->delta = (uint64_t)signed_rtt;
 
             packet_count++;
             if (packet_count > cfg.warmup) {
@@ -447,14 +459,8 @@ void emit(config_t cfg) {
 		    printf("  T1_HW (NIC tx):  %ld.%09ld\n", rtt->hw_tx.tv_sec, rtt->hw_tx.tv_nsec);
 		    printf("  T4_HW (NIC rx):  %ld.%09ld\n", rtt->hw_rx.tv_sec, rtt->hw_rx.tv_nsec);
 		    if (cfg.use_sw_timestamps) {
-			int64_t tx_delay = (rtt->hw_tx.tv_sec - rtt->sw_tx.tv_sec) * 1000000000LL +
-					   (rtt->hw_tx.tv_nsec - rtt->sw_tx.tv_nsec);
-			int64_t rx_delay = (rtt->sw_rx.tv_sec - rtt->hw_rx.tv_sec) * 1000000000LL +
-					   (rtt->sw_rx.tv_nsec - rtt->hw_rx.tv_nsec);
-			printf("  T1_SW (app tx):  %ld.%09ld\n", rtt->sw_tx.tv_sec, rtt->sw_tx.tv_nsec);
-			printf("  T4_SW (app rx):  %ld.%09ld\n", rtt->sw_rx.tv_sec, rtt->sw_rx.tv_nsec);
-			printf("  App-to-NIC (T1_HW - T1_SW): %"PRId64" ns\n", tx_delay);
-			printf("  NIC-to-app (T4_SW - T4_HW): %"PRId64" ns\n", rx_delay);
+			printf("  T1_SW (kern tx): %ld.%09ld\n", rtt->sw_tx.tv_sec, rtt->sw_tx.tv_nsec);
+			printf("  T4_SW (kern rx): %ld.%09ld\n", rtt->sw_rx.tv_sec, rtt->sw_rx.tv_nsec);
 		    }
 
 		    /* Write to trace_marker for kernel tracing correlation */
@@ -495,7 +501,8 @@ void reflect(config_t cfg) {
     struct hwtstamp_config hw_cfg = { .tx_type = HWTSTAMP_TX_ON, .rx_filter = HWTSTAMP_FILTER_ALL };
     ifr.ifr_data = (char *)&hw_cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
 
-    int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
+    int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE
+              | SOF_TIMESTAMPING_SOFTWARE | SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_RX_SOFTWARE;
     setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
 
     /* Set busy poll socket options if configured */
@@ -574,11 +581,12 @@ void reflect(config_t cfg) {
         goto done;
 
     if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
+        /* T2_HW + T2_SW: extract both from cmsg */
+        get_ts(&msg_rx, &resp->hw_rx,
+               cfg.use_sw_timestamps ? &resp->sw_rx : NULL);
+        /* T3_SW: Software timestamp before sendto */
         if (cfg.use_sw_timestamps)
-            clock_gettime(CLOCK_TAI, &resp->sw_rx);
-        get_ts(&msg_rx, &resp->hw_rx);
-        if (cfg.use_sw_timestamps)
-            clock_gettime(CLOCK_TAI, &resp->sw_tx);
+            clock_gettime(CLOCK_REALTIME, &resp->sw_tx);
         sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
     }
 
@@ -602,20 +610,31 @@ void reflect(config_t cfg) {
         msg_tx.msg_controllen = sizeof(cbuf_tx);
         msg_tx.msg_flags = 0;
         if (recvmsg(s, &msg_tx, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {
-            get_ts(&msg_tx, &resp->hw_tx);
+            /* T3_HW from error queue (TX SW not available via cmsg) */
+            get_ts(&msg_tx, &resp->hw_tx, NULL);
 
             /* Calculate Response latency for PREVIOUS packet: T3_HW - T2_HW */
-            resp->delta =
+            int64_t signed_delta =
                 (resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
                 (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
+            if (signed_delta < 0) { negative_delta_count++; signed_delta = 0; }
+            resp->delta = (uint64_t)signed_delta;
 
             packet_count++;
 
             /* Start timing when warmup completes */
             if (packet_count == cfg.warmup) {
                 test_start_tsc = rdtsc();
-                if (trace_marker_fd >= 0)
-                    write_trace_marker("RANT_TEST_START reflect\n");
+                if (trace_marker_fd >= 0) {
+                    char marker[128];
+                    struct timespec now;
+                    clock_gettime(CLOCK_TAI, &now);
+                    snprintf(marker, sizeof(marker),
+                        "RANT_TEST_START reflect phc=%ld.%09ld sys=%ld.%09ld\n",
+                        resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec,
+                        now.tv_sec, now.tv_nsec);
+                    write_trace_marker(marker);
+                }
                 if (verbose && cfg.warmup > 0)
                     fprintf(stderr, "✅ Warmup complete (%"PRIu64" packets), test started\n", cfg.warmup);
                 else if (verbose)
@@ -631,24 +650,26 @@ void reflect(config_t cfg) {
                     printf("  T2_HW (NIC rx):  %ld.%09ld\n", resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec);
                     printf("  T3_HW (NIC tx):  %ld.%09ld\n", resp->hw_tx.tv_sec, resp->hw_tx.tv_nsec);
                     if (cfg.use_sw_timestamps) {
-                        int64_t rx_delay = (resp->sw_rx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
-                                           (resp->sw_rx.tv_nsec - resp->hw_rx.tv_nsec);
-                        int64_t tx_delay = (resp->hw_tx.tv_sec - resp->sw_tx.tv_sec) * 1000000000LL +
-                                           (resp->hw_tx.tv_nsec - resp->sw_tx.tv_nsec);
-                        printf("  T2_SW (app rx):  %ld.%09ld\n", resp->sw_rx.tv_sec, resp->sw_rx.tv_nsec);
-                        printf("  T3_SW (app tx):  %ld.%09ld\n", resp->sw_tx.tv_sec, resp->sw_tx.tv_nsec);
-                        printf("  NIC-to-app (T2_SW - T2_HW): %"PRId64" ns\n", rx_delay);
-                        printf("  App-to-NIC (T3_HW - T3_SW): %"PRId64" ns\n", tx_delay);
-                        printf("  App processing (T3_SW - T2_SW): %"PRId64" ns\n",
+                        int64_t app_processing =
                             (resp->sw_tx.tv_sec - resp->sw_rx.tv_sec) * 1000000000LL +
-                            (resp->sw_tx.tv_nsec - resp->sw_rx.tv_nsec));
+                            (resp->sw_tx.tv_nsec - resp->sw_rx.tv_nsec);
+                        int64_t nic_overhead = (int64_t)resp->delta - app_processing;
+                        printf("  T2_SW (kern rx): %ld.%09ld\n", resp->sw_rx.tv_sec, resp->sw_rx.tv_nsec);
+                        printf("  T3_SW (kern tx): %ld.%09ld\n", resp->sw_tx.tv_sec, resp->sw_tx.tv_nsec);
+                        printf("  App processing (T3_SW - T2_SW): %"PRId64" ns\n", app_processing);
+                        printf("  NIC overhead (HW delta - app):  %"PRId64" ns\n", nic_overhead);
                     }
 
                     if (trace_marker_fd >= 0) {
                         char trace_msg[256];
+                        struct timespec now;
+                        clock_gettime(CLOCK_TAI, &now);
                         snprintf(trace_msg, sizeof(trace_msg),
-                                 "rant: Response threshold exceeded: seq=%"PRIu64" latency=%"PRIu64"ns threshold=%"PRIu64"ns\n",
-                                 packet_count, resp->delta, cfg.threshold);
+                                 "rant: Response threshold exceeded: seq=%"PRIu64" latency=%"PRIu64"ns"
+                                 " phc=%ld.%09ld sys=%ld.%09ld\n",
+                                 packet_count, resp->delta,
+                                 resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec,
+                                 now.tv_sec, now.tv_nsec);
                         write_trace_marker(trace_msg);
                     }
                     if (snapshot_fd >= 0)
@@ -686,11 +707,12 @@ void reflect(config_t cfg) {
 
         /* Receive THIS ping & send pong */
         if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
+            /* T2_HW + T2_SW: extract both from cmsg */
+            get_ts(&msg_rx, &resp->hw_rx,
+                   cfg.use_sw_timestamps ? &resp->sw_rx : NULL);
+            /* T3_SW: Software timestamp before sendto */
             if (cfg.use_sw_timestamps)
-                clock_gettime(CLOCK_TAI, &resp->sw_rx);
-            get_ts(&msg_rx, &resp->hw_rx);
-            if (cfg.use_sw_timestamps)
-                clock_gettime(CLOCK_TAI, &resp->sw_tx);
+                clock_gettime(CLOCK_REALTIME, &resp->sw_tx);
             sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
         }
 
@@ -735,6 +757,8 @@ void show_stats() {
     printf("\n--- Latency Statistics ---\n");
     printf("MIN: %"PRIu64" ns | MAX: %"PRIu64" ns | AVG: %"PRIu64" ns | Total Samples: %"PRIu64" \n\n",
             stats.count ? stats.min : 0, stats.count ? stats.max : 0, stats.count ? (uint64_t) stats.sum / stats.count : 0, stats.count);
+    if (negative_delta_count > 0)
+        printf("WARNING: %"PRIu64" negative deltas detected (set to 0). Check PTP clock sync.\n\n", negative_delta_count);
 }
 
 void response_log(const char *filename) {

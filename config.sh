@@ -26,6 +26,10 @@
 #   --irq-prio <n>           IRQ thread FIFO priority (default: 55)
 #   --ksoftirqd-prio <n>     ksoftirqd FIFO priority (default: 11)
 #   -h, --help               Show this help
+#
+# Dual-port cards: configure BOTH ports before testing. The script saves IRQ
+# thread state and automatically re-pins sibling port threads if ethtool -L
+# resets them. For best results, configure the client port first, then server.
 
 set -e
 
@@ -48,7 +52,7 @@ ptp_source=""
 ptp_sync_to=""
 skip_namespace=0
 skip_ptp=0
-irq_prio=55
+irq_prio=90
 ksoftirqd_prio=11
 
 while [[ $# -gt 0 ]]; do
@@ -105,9 +109,9 @@ driver=$(ethtool -i "$ifname" 2>/dev/null | awk '/driver:/{print $2}')
 # IRQ name pattern (e.g. mlx5_comp0@pci:0000:ae:00.0)
 irq_pattern="@pci:0000:${pci}"
 
-# PTP clock (auto-detect from sysfs)
+# PTP clock (auto-detect from PCI address — works even after namespace move)
 if [[ -z "$ptp_source" ]]; then
-    ptp_dev=$(ls -d /sys/class/net/"$ifname"/device/ptp/ptp* 2>/dev/null | head -1)
+    ptp_dev=$(ls -d /sys/bus/pci/devices/0000:${pci}/ptp/ptp* 2>/dev/null | head -1)
     if [[ -n "$ptp_dev" ]]; then
         ptp_source="/dev/$(basename "$ptp_dev")"
     fi
@@ -159,7 +163,16 @@ fi
 # --- Ethtool tuning ---
 
 # Queue and offload settings (driver-independent)
-$ns_cmd ethtool -L "$ifname" combined 1
+# Skip ethtool -L if already combined 1 — on dual-port cards, ethtool -L on one
+# port resets IRQ thread affinities for BOTH ports, undoing previous pinning.
+current_combined=$($ns_cmd ethtool -l "$ifname" 2>/dev/null | awk '/^Combined:/{val=$2} END{print val}')
+if [[ "$current_combined" != "1" ]]; then
+    $ns_cmd ethtool -L "$ifname" combined 1
+else
+    { set +x; } 2>/dev/null
+    echo "  ethtool -L: already combined 1, skipping (avoids dual-port affinity reset)"
+    set -x
+fi
 $ns_cmd ethtool -K "$ifname" rx-checksumming off tx-checksumming off
 $ns_cmd ethtool -K "$ifname" lro off gro off
 $ns_cmd ethtool -K "$ifname" tso off gso off
@@ -192,7 +205,7 @@ $ns_cmd bash -c "echo 0 > /sys/class/net/$ifname/gro_flush_timeout"
 # --- Interface and IP setup ---
 $ns_cmd ip link set lo up
 $ns_cmd ip link set "$ifname" up
-$ns_cmd ip addr add "${ip_addr}/24" dev "$ifname"
+$ns_cmd ip addr add "${ip_addr}/24" dev "$ifname" 2>/dev/null || true
 
 # Qdisc
 $ns_cmd tc qdisc replace dev "$ifname" root noqueue
@@ -213,27 +226,104 @@ $ns_cmd sysctl -w net.ipv4.conf.all.arp_announce=2
 # --- CPU isolation and IRQ affinity ---
 tuna isolate -c "$cpu,$irq_cpu"
 
-irq_thread=$(pgrep -f "$irq_pattern" | head -1)
-if [[ -n "$irq_thread" ]]; then
-    tuna move -q "*${irq_pattern}*" -c "$irq_cpu"
-    chrt -f -p "$irq_prio" "$irq_thread"
+# Find the mlx5_comp0 data path IRQ thread (NOT mlx5_async0)
+comp_thread=$(pgrep -f "mlx5_comp0${irq_pattern}" | head -1)
+async_thread=$(pgrep -f "mlx5_async0${irq_pattern}" | head -1)
+
+if [[ -n "$comp_thread" ]]; then
+    # Set comp0 (data path) to high priority and pin to IRQ CPU
+    taskset -p -c "$irq_cpu" "$comp_thread"
+    chrt -f -p "$irq_prio" "$comp_thread"
     { set +x; } 2>/dev/null
     echo ""
-    echo "=== IRQ thread ==="
-    echo "  PID:      $irq_thread"
-    echo "  CPU:      $(cat /proc/$irq_thread/status 2>/dev/null | grep Cpus_allowed_list)"
-    echo "  Priority: $(chrt -p $irq_thread)"
-    echo ""
+    echo "=== mlx5_comp0 (data path) ==="
+    echo "  PID:      $comp_thread"
+    echo "  CPU:      $(cat /proc/$comp_thread/status 2>/dev/null | grep Cpus_allowed_list)"
+    echo "  Priority: $(chrt -p $comp_thread)"
     set -x
 else
-    echo "WARNING: IRQ thread matching *${irq_pattern}* not found"
+    echo "WARNING: mlx5_comp0 thread matching *mlx5_comp0${irq_pattern}* not found"
 fi
+
+if [[ -n "$async_thread" ]]; then
+    # Set async0 (firmware events) to low priority — must not preempt comp0
+    taskset -p -c "$irq_cpu" "$async_thread"
+    chrt -f -p "$ksoftirqd_prio" "$async_thread"
+    { set +x; } 2>/dev/null
+    echo "=== mlx5_async0 (firmware events) ==="
+    echo "  PID:      $async_thread"
+    echo "  Priority: $(chrt -p $async_thread)"
+    set -x
+fi
+
+# Move all other IRQ threads off the app and IRQ CPUs
+{ set +x; } 2>/dev/null
+echo ""
+echo "=== Moving other IRQ threads off CPUs $cpu and $irq_cpu ==="
+for target_cpu in $cpu $irq_cpu; do
+    for pid in $(ps -eLo pid,psr,comm | awk -v cpu="$target_cpu" '$2==cpu && $3~/^irq\// {print $1}'); do
+        comm=$(cat /proc/$pid/comm 2>/dev/null)
+        # Skip our mlx5 comp0 and async0 threads
+        if [[ "$pid" != "$comp_thread" && "$pid" != "$async_thread" ]]; then
+            taskset -p -c 0 "$pid" 2>/dev/null && \
+                echo "  Moved $comm (PID $pid) off CPU $target_cpu"
+        fi
+    done
+done
+set -x
+
+# Dual-port fix: if ethtool -L ran and reset the sibling port's affinity, re-pin it.
+# On dual-port cards, ethtool -L on one port resets IRQ thread affinities for both ports.
+# We save/restore sibling state using a temp file keyed by PCI bus address.
+pci_bus="${pci%.*}"  # e.g. ae:00 (strip .0 or .1)
+state_dir="/tmp/config_sh_irq_state"
+mkdir -p "$state_dir"
+
+# Save our comp0/async0 state so the sibling config.sh run can restore us
+{ set +x; } 2>/dev/null
+echo "$irq_cpu $irq_prio $comp_thread" > "$state_dir/${pci}_comp0"
+if [[ -n "$async_thread" ]]; then
+    echo "$irq_cpu $ksoftirqd_prio $async_thread" > "$state_dir/${pci}_async0"
+fi
+
+# Check if sibling port was already configured — if so, restore its affinity
+for state_file in "$state_dir/${pci_bus}."*_comp0; do
+    [[ -f "$state_file" ]] || continue
+    # Skip our own state file
+    [[ "$state_file" == "$state_dir/${pci}_comp0" ]] && continue
+    read -r sib_cpu sib_prio sib_pid < "$state_file"
+    if [[ -n "$sib_pid" ]] && kill -0 "$sib_pid" 2>/dev/null; then
+        sib_comm=$(cat /proc/$sib_pid/comm 2>/dev/null)
+        current_cpu=$(ps -o psr= -p "$sib_pid" 2>/dev/null | tr -d ' ')
+        if [[ "$current_cpu" != "$sib_cpu" ]]; then
+            echo "  Dual-port fix: $sib_comm (PID $sib_pid) drifted to CPU $current_cpu, re-pinning to CPU $sib_cpu"
+            taskset -p -c "$sib_cpu" "$sib_pid" 2>/dev/null
+        fi
+        chrt -f -p "$sib_prio" "$sib_pid" 2>/dev/null
+    fi
+done
+for state_file in "$state_dir/${pci_bus}."*_async0; do
+    [[ -f "$state_file" ]] || continue
+    [[ "$state_file" == "$state_dir/${pci}_async0" ]] && continue
+    read -r sib_cpu sib_prio sib_pid < "$state_file"
+    if [[ -n "$sib_pid" ]] && kill -0 "$sib_pid" 2>/dev/null; then
+        sib_comm=$(cat /proc/$sib_pid/comm 2>/dev/null)
+        current_cpu=$(ps -o psr= -p "$sib_pid" 2>/dev/null | tr -d ' ')
+        if [[ "$current_cpu" != "$sib_cpu" ]]; then
+            echo "  Dual-port fix: $sib_comm (PID $sib_pid) drifted to CPU $current_cpu, re-pinning to CPU $sib_cpu"
+            taskset -p -c "$sib_cpu" "$sib_pid" 2>/dev/null
+        fi
+        chrt -f -p "$sib_prio" "$sib_pid" 2>/dev/null
+    fi
+done
+set -x
 
 # ksoftirqd priority
 ksoftirqd_pid=$(pgrep -x "ksoftirqd/$irq_cpu")
 if [[ -n "$ksoftirqd_pid" ]]; then
     chrt -f -p "$ksoftirqd_prio" "$ksoftirqd_pid"
     { set +x; } 2>/dev/null
+    echo ""
     echo "=== ksoftirqd/$irq_cpu ==="
     echo "  Priority: $(chrt -p $ksoftirqd_pid)"
     echo ""
@@ -243,15 +333,26 @@ fi
 # --- PCIe power management disable ---
 setpci -s "$pci" 0xd0.b=0x00
 
-# --- PTP sync ---
+# --- PTP clock setup ---
 if [[ "$skip_ptp" -eq 0 && -n "$ptp_source" ]]; then
-    if [[ -n "$ptp_sync_to" ]]; then
-        # Sync source PTP clock to another PTP device (e.g. port0 -> port1)
-        phc2sys -s "$ptp_source" -c "$ptp_sync_to" -O 0 -S 0.0 -q &
-    else
-        # Sync PTP clock to system clock
-        phc2sys -s "$ptp_source" -O 0 -S 0.0 -P 1.0 -I 0.1 -R 16 -q &
-    fi
+    # Kill ALL phc2sys instances — continuous PHC adjustment during the test
+    # causes backward clock jumps (negative deltas). Each side of rant only
+    # compares timestamps from its OWN PHC, so drift from wall clock is irrelevant.
+    pkill -f "phc2sys" 2>/dev/null || true
+    sleep 0.5
+
+    # Step-correct PHC to system time (for human-readable log timestamps only)
+    phc_ctl "$ptp_source" set $(date +%s.%N) 2>/dev/null || true
+
+    { set +x; } 2>/dev/null
+    echo ""
+    echo "=== PTP clock ==="
+    echo "  PHC device: $ptp_source"
+    echo "  Mode:       step-corrected to system time, then free-running"
+    echo "  Note:       phc2sys killed — PHC will drift ~1ppm from wall clock"
+    echo "              This does NOT affect latency measurements (same-clock deltas)"
+    echo ""
+    set -x
 fi
 
 { set +x; } 2>/dev/null
