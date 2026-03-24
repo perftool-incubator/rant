@@ -35,7 +35,6 @@ typedef struct {
     const char *iface;
     const char *ip;
     uint64_t threshold;
-    int use_sw_timestamps;
     int show_histogram;
     const char *log_file;
     uint64_t bucket_overflow;
@@ -59,9 +58,10 @@ size_t overflow_samples_bytes = 0;  // Track allocation size for munmap
 int using_hugepages_overflow = 0;  // Track if overflow used hugepages
 
 struct record {
-    struct timespec hw_tx, hw_rx, sw_tx, sw_rx;
+    struct timespec hw_tx, hw_rx;
+    uint64_t sw_tx, sw_rx;  /* RDTSC cycles — converted to ns at output */
     uint64_t delta;
-};  /* 72 bytes natural packing - cache alignment removed due to memory cost */
+};
 
 struct Stats {
     uint64_t min;
@@ -94,13 +94,12 @@ void handle_sig(int sig) {
     keep_running = 0;
 }
 
-void get_ts(struct msghdr *msg, struct timespec *hw_ts, struct timespec *sw_ts) {
+void get_ts(struct msghdr *msg, struct timespec *hw_ts) {
     struct cmsghdr *cmsg;
     for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
         if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
             struct timespec *stamps = (struct timespec *)CMSG_DATA(cmsg);
             if (hw_ts) *hw_ts = stamps[2];  /* RAW_HARDWARE (PHC clock) */
-            if (sw_ts) *sw_ts = stamps[0];  /* SOFTWARE (CLOCK_REALTIME) */
         }
     }
 }
@@ -112,14 +111,30 @@ static inline uint64_t rdtsc(void) {
     return ((uint64_t)hi << 32) | lo;
 }
 
-uint64_t calibrate_rdtsc() {
-    /* one sec */
+/* RDTSC calibration globals — used to convert cycles to TAI nanoseconds */
+uint64_t cycles_per_sec = 0;
+uint64_t rdtsc_ref = 0;        /* RDTSC value at anchor point */
+uint64_t tai_ref_ns = 0;       /* CLOCK_TAI nanoseconds at anchor point */
+
+void calibrate_rdtsc() {
     struct timespec sleep_time = {1, 0};
     uint64_t start = rdtsc();
     nanosleep(&sleep_time, NULL);
     uint64_t end = rdtsc();
-    /* Cycles Per Second */
-    return end - start;
+    cycles_per_sec = end - start;
+
+    /* Anchor RDTSC to CLOCK_TAI for log correlation with ftrace (tai clock) and PHC */
+    struct timespec tai;
+    rdtsc_ref = rdtsc();
+    clock_gettime(CLOCK_TAI, &tai);
+    tai_ref_ns = (uint64_t)tai.tv_sec * 1000000000ULL + (uint64_t)tai.tv_nsec;
+}
+
+/* Convert RDTSC cycles to CLOCK_TAI nanoseconds */
+static inline uint64_t rdtsc_to_tai_ns(uint64_t tsc) {
+    int64_t delta_cycles = (int64_t)(tsc - rdtsc_ref);
+    int64_t delta_ns = delta_cycles * (int64_t)1000000000LL / (int64_t)cycles_per_sec;
+    return tai_ref_ns + delta_ns;
 }
 
 /* Try to open a tracefs file, checking multiple paths */
@@ -173,6 +188,7 @@ void open_snapshot() {
     } else if (verbose) {
         fprintf(stderr, "✅ Trace snapshot enabled\n");
     }
+
 }
 
 /* Close trace_marker and tracing_on file descriptors */
@@ -307,8 +323,7 @@ void emit(config_t cfg) {
     struct hwtstamp_config hw_cfg = { .tx_type = HWTSTAMP_TX_ON, .rx_filter = HWTSTAMP_FILTER_ALL };
     ifr.ifr_data = (char *)&hw_cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
 
-    int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE
-              | SOF_TIMESTAMPING_SOFTWARE | SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_RX_SOFTWARE;
+    int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
     setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
 
     /* Set busy poll socket options if configured */
@@ -341,7 +356,7 @@ void emit(config_t cfg) {
     /* TX */
     char buf_tx[1];
     char cbuf_tx[256];
-    struct pollfd pfd_tx = { .fd = s, .events = POLLERR };
+    struct pollfd pfd_tx = { .fd = s, .events = POLLPRI };
     struct iovec iov_tx;
     iov_tx.iov_base = buf_tx; iov_tx.iov_len = sizeof(buf_tx);
     struct msghdr msg_tx = {0};
@@ -351,9 +366,9 @@ void emit(config_t cfg) {
 
     if (verbose)
         fprintf(stderr, "\n⏱️  Calibrating RDTSC...\n");
-    uint64_t cycles_per_sec = calibrate_rdtsc();
+    calibrate_rdtsc();
     if (verbose)
-        fprintf(stderr, "✅ RDTSC: %"PRIu64" cycles/sec\n", cycles_per_sec);
+        fprintf(stderr, "✅ RDTSC: %"PRIu64" cycles/sec, anchored to TAI\n", cycles_per_sec);
     uint64_t start_tsc = rdtsc();
     uint64_t test_start_tsc = start_tsc;
     uint64_t deadline = cfg.duration > 0 ? start_tsc + (cfg.duration * cycles_per_sec): 0;
@@ -402,88 +417,78 @@ void emit(config_t cfg) {
             rtt = &warmup_record;
         }
 
-	/* T1_SW: Software timestamp before sendto */
-	if (cfg.use_sw_timestamps)
-	    clock_gettime(CLOCK_REALTIME, &rtt->sw_tx);
+        /* T1_SW: RDTSC before sendto */
+        rtt->sw_tx = rdtsc();
 
-	/* Send Ping */
-	sendto(s, buf_tx, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
+        /* Send Ping */
+        sendto(s, buf_tx, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
 
-        /* T1_HW: Hardware timestamp when ping is sent */
-        while (poll(&pfd_tx, 1, 0) <= 0 && keep_running) {
-            if (cfg.duration > 0 && rdtsc() > deadline)
-                break;
+        /* Wait for TX timestamp (blocks until POLLPRI or signal) */
+        msg_tx.msg_controllen = sizeof(cbuf_tx);
+        msg_tx.msg_flags = 0;
+        while (poll(&pfd_tx, 1, -1) <= 0) {
+            if (!keep_running) break;
         }
+        if (!keep_running) break;
 
-	/* Reset length before fetching from Error Queue */
-	msg_tx.msg_controllen = sizeof(cbuf_tx);
-	msg_tx.msg_flags = 0;
-	if (recvmsg(s, &msg_tx, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {
-	    /* Reset hw_tx to ensure we are not seeing stale data */
-	    rtt->hw_tx.tv_sec = 0;
-            rtt->hw_tx.tv_nsec = 0;
-            get_ts(&msg_tx, &rtt->hw_tx, NULL);
-        }
+        /* Retrieve T1_HW from error queue */
+        rtt->hw_tx.tv_sec = 0;
+        rtt->hw_tx.tv_nsec = 0;
+        recvmsg(s, &msg_tx, MSG_ERRQUEUE);
+        get_ts(&msg_tx, &rtt->hw_tx);
 
-        /* Reset length before fetching the response */
-	msg_rx.msg_controllen = sizeof(cbuf_rx);
+        /* Wait for pong (blocks until POLLIN or signal) */
+        msg_rx.msg_controllen = sizeof(cbuf_rx);
         msg_rx.msg_flags = 0;
-
-	/* wait for pong */
-        while (poll(&pfd_rx, 1, 0) <= 0 && keep_running) {
-            if (cfg.duration > 0 && rdtsc() > deadline)
-                break;
+        while (poll(&pfd_rx, 1, -1) <= 0) {
+            if (!keep_running) break;
         }
+        if (!keep_running) break;
 
-        /* Packet arrived: Receive Pong & Get RX Timestamp */
-        if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
+        /* Receive Pong — T4_HW from cmsg, T4_SW from RDTSC */
+        recvmsg(s, &msg_rx, 0);
+        rtt->sw_rx = rdtsc();
+        get_ts(&msg_rx, &rtt->hw_rx);
 
-            /* T4_HW + T4_SW: extract both from cmsg */
-            get_ts(&msg_rx, &rtt->hw_rx,
-                   cfg.use_sw_timestamps ? &rtt->sw_rx : NULL);
+        /* Calculate Round Trip Time latency: T4_HW - T1_HW */
+        int64_t signed_rtt =
+            (rtt->hw_rx.tv_sec - rtt->hw_tx.tv_sec) * 1000000000LL +
+            (rtt->hw_rx.tv_nsec - rtt->hw_tx.tv_nsec);
+        if (signed_rtt < 0) { negative_delta_count++; signed_rtt = 0; }
+        rtt->delta = (uint64_t)signed_rtt;
 
-            /* Calculate Round Trip Time latency: T4_HW - T1_HW */
-            int64_t signed_rtt =
-		    (rtt->hw_rx.tv_sec - rtt->hw_tx.tv_sec) * 1000000000LL +
-                    (rtt->hw_rx.tv_nsec - rtt->hw_tx.tv_nsec);
-            if (signed_rtt < 0) { negative_delta_count++; signed_rtt = 0; }
-            rtt->delta = (uint64_t)signed_rtt;
+        packet_count++;
+        if (packet_count > cfg.warmup) {
+            histogram_record(rtt->delta, cfg);
 
-            packet_count++;
-            if (packet_count > cfg.warmup) {
-	        histogram_record(rtt->delta, cfg);
+            if (cfg.threshold > 0 && rtt->delta > cfg.threshold) {
+                printf("Round-Trip latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
+                       rtt->delta, cfg.threshold);
+                printf("  T1_HW (NIC tx):  %ld.%09ld\n", rtt->hw_tx.tv_sec, rtt->hw_tx.tv_nsec);
+                printf("  T4_HW (NIC rx):  %ld.%09ld\n", rtt->hw_rx.tv_sec, rtt->hw_rx.tv_nsec);
+                printf("  T1_SW (RDTSC):   %"PRIu64"\n", rtt->sw_tx);
+                printf("  T4_SW (RDTSC):   %"PRIu64"\n", rtt->sw_rx);
 
-		if (cfg.threshold > 0 && rtt->delta > cfg.threshold) {
-		    printf("Round-Trip latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
-			   rtt->delta, cfg.threshold);
-		    printf("  T1_HW (NIC tx):  %ld.%09ld\n", rtt->hw_tx.tv_sec, rtt->hw_tx.tv_nsec);
-		    printf("  T4_HW (NIC rx):  %ld.%09ld\n", rtt->hw_rx.tv_sec, rtt->hw_rx.tv_nsec);
-		    if (cfg.use_sw_timestamps) {
-			printf("  T1_SW (kern tx): %ld.%09ld\n", rtt->sw_tx.tv_sec, rtt->sw_tx.tv_nsec);
-			printf("  T4_SW (kern rx): %ld.%09ld\n", rtt->sw_rx.tv_sec, rtt->sw_rx.tv_nsec);
-		    }
+                /* Write to trace_marker for kernel tracing correlation */
+                if (trace_marker_fd >= 0) {
+                    char trace_msg[256];
+                    snprintf(trace_msg, sizeof(trace_msg),
+                             "rant: RTT threshold exceeded: seq=%"PRIu64" latency=%"PRIu64"ns threshold=%"PRIu64"ns\n",
+                             packet_count, rtt->delta, cfg.threshold);
+                    write_trace_marker(trace_msg);
+                }
+                if (snapshot_fd >= 0)
+                    write(snapshot_fd, "1", 1);
+                if (tracing_on_fd >= 0)
+                    write(tracing_on_fd, "0", 1);
 
-		    /* Write to trace_marker for kernel tracing correlation */
-		    if (trace_marker_fd >= 0) {
-			char trace_msg[256];
-			snprintf(trace_msg, sizeof(trace_msg),
-				 "rant: RTT threshold exceeded: seq=%"PRIu64" latency=%"PRIu64"ns threshold=%"PRIu64"ns\n",
-				 packet_count, rtt->delta, cfg.threshold);
-			write_trace_marker(trace_msg);
-		    }
-		    if (snapshot_fd >= 0)
-			write(snapshot_fd, "1", 1);
-		    if (tracing_on_fd >= 0)
-			write(tracing_on_fd, "0", 1);
-
-		    /* exit early: threshold exceeded */
-		    keep_running = 0;
-		    break;
-	        }
+                /* exit early: threshold exceeded */
+                keep_running = 0;
+                break;
             }
         }
 
-	/* check if duration timed out */
+        /* check if duration timed out */
         if (cfg.duration > 0 && rdtsc() > deadline)
             break;
     }
@@ -501,8 +506,7 @@ void reflect(config_t cfg) {
     struct hwtstamp_config hw_cfg = { .tx_type = HWTSTAMP_TX_ON, .rx_filter = HWTSTAMP_FILTER_ALL };
     ifr.ifr_data = (char *)&hw_cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
 
-    int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE
-              | SOF_TIMESTAMPING_SOFTWARE | SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_RX_SOFTWARE;
+    int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
     setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
 
     /* Set busy poll socket options if configured */
@@ -538,7 +542,7 @@ void reflect(config_t cfg) {
     /* TX */
     char buf_tx[1];
     char cbuf_tx[256];
-    struct pollfd pfd_tx = { .fd = s, .events = POLLERR };
+    struct pollfd pfd_tx = { .fd = s, .events = POLLPRI };
     struct iovec iov_tx;
     iov_tx.iov_base = buf_tx; iov_tx.iov_len = sizeof(buf_tx);
     struct msghdr msg_tx = {0};
@@ -547,154 +551,30 @@ void reflect(config_t cfg) {
 
     if (verbose)
         fprintf(stderr, "\n⏱️  Calibrating RDTSC...\n");
-    uint64_t cycles_per_sec = calibrate_rdtsc();
+    calibrate_rdtsc();
     if (verbose)
-        fprintf(stderr, "✅ RDTSC: %"PRIu64" cycles/sec\n", cycles_per_sec);
+        fprintf(stderr, "✅ RDTSC: %"PRIu64" cycles/sec, anchored to TAI\n", cycles_per_sec);
     uint64_t start_tsc = rdtsc();
     uint64_t test_start_tsc = start_tsc;
     uint64_t deadline = cfg.duration > 0 ? start_tsc + (cfg.duration * cycles_per_sec): 0;
     uint64_t packet_count = 0;
-    struct record warmup_record;  /* Temporary storage for warmup packets */
+    struct record warmup_record;
     struct record *resp;
 
     if (verbose)
         fprintf(stderr, "\n⏳ Waiting for first packet...\n");
 
-    /* Allocate record for first packet */
-    if (packet_count >= cfg.warmup && log_book != NULL) {
-        resp = &log_book[circular_log ? (log_size % log_capacity) : log_size];
-        log_size++;
-    } else {
-        resp = &warmup_record;
-    }
+    /* RDTSC checkpoints for spike instrumentation */
+    uint64_t tsc_poll, tsc_recvmsg, tsc_get_ts, tsc_sendto, tsc_poll_tx, tsc_errqueue;
 
-    /* Bootstrap: receive first ping and send first pong.
-     * The main loop collects the TX timestamp for the PREVIOUS pong
-     * when the NEXT ping arrives, so the first ping/pong is handled here. */
-    msg_rx.msg_controllen = sizeof(cbuf_rx);
-    msg_rx.msg_flags = 0;
-    while (poll(&pfd_rx, 1, 0) <= 0 && keep_running) {
-        if (cfg.duration > 0 && rdtsc() > deadline)
-            break;
-    }
-    if (!keep_running || (cfg.duration > 0 && rdtsc() > deadline))
-        goto done;
-
-    if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
-        /* T2_HW + T2_SW: extract both from cmsg */
-        get_ts(&msg_rx, &resp->hw_rx,
-               cfg.use_sw_timestamps ? &resp->sw_rx : NULL);
-        /* T3_SW: Software timestamp before sendto */
-        if (cfg.use_sw_timestamps)
-            clock_gettime(CLOCK_REALTIME, &resp->sw_tx);
-        sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
-    }
-
-    /* Main loop: deferred TX timestamp with single poll.
-     * poll(POLLIN) may also wake on POLLERR (TX completion ready).
-     * When POLLERR fires without POLLIN, collect ERRQUEUE and keep polling.
-     * When POLLIN fires, collect ERRQUEUE (if ready) then receive ping. */
     while (keep_running) {
 
-        /* Wait for next ping */
-        msg_rx.msg_controllen = sizeof(cbuf_rx);
-        msg_rx.msg_flags = 0;
-        while (poll(&pfd_rx, 1, 0) <= 0 && keep_running) {
-            if (cfg.duration > 0 && rdtsc() > deadline)
-                break;
-        }
-        if (!keep_running || (cfg.duration > 0 && rdtsc() > deadline))
-            break;
-
-        /* Always try ERRQUEUE — TX completion may or may not be ready */
-        msg_tx.msg_controllen = sizeof(cbuf_tx);
-        msg_tx.msg_flags = 0;
-        if (recvmsg(s, &msg_tx, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {
-            /* T3_HW from error queue (TX SW not available via cmsg) */
-            get_ts(&msg_tx, &resp->hw_tx, NULL);
-
-            /* Calculate Response latency for PREVIOUS packet: T3_HW - T2_HW */
-            int64_t signed_delta =
-                (resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
-                (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
-            if (signed_delta < 0) { negative_delta_count++; signed_delta = 0; }
-            resp->delta = (uint64_t)signed_delta;
-
-            packet_count++;
-
-            /* Start timing when warmup completes */
-            if (packet_count == cfg.warmup) {
-                test_start_tsc = rdtsc();
-                if (trace_marker_fd >= 0) {
-                    char marker[128];
-                    struct timespec now;
-                    clock_gettime(CLOCK_TAI, &now);
-                    snprintf(marker, sizeof(marker),
-                        "RANT_TEST_START reflect phc=%ld.%09ld sys=%ld.%09ld\n",
-                        resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec,
-                        now.tv_sec, now.tv_nsec);
-                    write_trace_marker(marker);
-                }
-                if (verbose && cfg.warmup > 0)
-                    fprintf(stderr, "✅ Warmup complete (%"PRIu64" packets), test started\n", cfg.warmup);
-                else if (verbose)
-                    fprintf(stderr, "🚀 Test started\n");
-            }
-
-            if (packet_count > cfg.warmup) {
-                histogram_record(resp->delta, cfg);
-
-                if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
-                    printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
-                           resp->delta, cfg.threshold);
-                    printf("  T2_HW (NIC rx):  %ld.%09ld\n", resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec);
-                    printf("  T3_HW (NIC tx):  %ld.%09ld\n", resp->hw_tx.tv_sec, resp->hw_tx.tv_nsec);
-                    if (cfg.use_sw_timestamps) {
-                        int64_t app_processing =
-                            (resp->sw_tx.tv_sec - resp->sw_rx.tv_sec) * 1000000000LL +
-                            (resp->sw_tx.tv_nsec - resp->sw_rx.tv_nsec);
-                        int64_t nic_overhead = (int64_t)resp->delta - app_processing;
-                        printf("  T2_SW (kern rx): %ld.%09ld\n", resp->sw_rx.tv_sec, resp->sw_rx.tv_nsec);
-                        printf("  T3_SW (kern tx): %ld.%09ld\n", resp->sw_tx.tv_sec, resp->sw_tx.tv_nsec);
-                        printf("  App processing (T3_SW - T2_SW): %"PRId64" ns\n", app_processing);
-                        printf("  NIC overhead (HW delta - app):  %"PRId64" ns\n", nic_overhead);
-                    }
-
-                    if (trace_marker_fd >= 0) {
-                        char trace_msg[256];
-                        struct timespec now;
-                        clock_gettime(CLOCK_TAI, &now);
-                        snprintf(trace_msg, sizeof(trace_msg),
-                                 "rant: Response threshold exceeded: seq=%"PRIu64" latency=%"PRIu64"ns"
-                                 " phc=%ld.%09ld sys=%ld.%09ld\n",
-                                 packet_count, resp->delta,
-                                 resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec,
-                                 now.tv_sec, now.tv_nsec);
-                        write_trace_marker(trace_msg);
-                    }
-                    if (snapshot_fd >= 0)
-                        write(snapshot_fd, "1", 1);
-                    if (tracing_on_fd >= 0)
-                        write(tracing_on_fd, "0", 1);
-
-                    keep_running = 0;
-                    break;
-                }
-            }
-        }
-
-        /* If no POLLIN, poll woke on POLLERR only — loop back to wait for ping */
-        if (!(pfd_rx.revents & POLLIN))
-            continue;
-
-        /* Allocate record for THIS packet */
+        /* Allocate record */
         if (packet_count >= cfg.warmup && log_book != NULL) {
             if (circular_log) {
                 resp = &log_book[log_size % log_capacity];
             } else if (log_size >= log_capacity) {
                 fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records)\n", log_capacity);
-                fprintf(stderr, "  Stopping test to prevent buffer overflow.\n");
-                fprintf(stderr, "  Consider using -d <seconds> for shorter tests or increase capacity.\n");
                 keep_running = 0;
                 break;
             } else {
@@ -705,22 +585,120 @@ void reflect(config_t cfg) {
             resp = &warmup_record;
         }
 
-        /* Receive THIS ping & send pong */
-        if (recvmsg(s, &msg_rx, MSG_DONTWAIT) > 0) {
-            /* T2_HW + T2_SW: extract both from cmsg */
-            get_ts(&msg_rx, &resp->hw_rx,
-                   cfg.use_sw_timestamps ? &resp->sw_rx : NULL);
-            /* T3_SW: Software timestamp before sendto */
-            if (cfg.use_sw_timestamps)
-                clock_gettime(CLOCK_REALTIME, &resp->sw_tx);
-            sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
+        /* Wait for ping (blocks until POLLIN or signal) */
+        msg_rx.msg_controllen = sizeof(cbuf_rx);
+        msg_rx.msg_flags = 0;
+        while (poll(&pfd_rx, 1, -1) <= 0) {
+            if (!keep_running) break;
+        }
+        if (!keep_running) break;
+        tsc_poll = rdtsc();
+
+        /* Receive ping — T2_HW from cmsg, T2_SW from RDTSC */
+        recvmsg(s, &msg_rx, 0);
+        tsc_recvmsg = rdtsc();
+        resp->sw_rx = tsc_recvmsg;
+        get_ts(&msg_rx, &resp->hw_rx);
+        tsc_get_ts = rdtsc();
+
+        /* Send pong — T3_SW from RDTSC */
+        resp->sw_tx = rdtsc();
+        sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
+        tsc_sendto = rdtsc();
+
+        /* Wait for TX timestamp (blocks until POLLPRI or signal) */
+        msg_tx.msg_controllen = sizeof(cbuf_tx);
+        msg_tx.msg_flags = 0;
+        while (poll(&pfd_tx, 1, -1) <= 0) {
+            if (!keep_running) break;
+        }
+        if (!keep_running) break;
+        tsc_poll_tx = rdtsc();
+
+        /* Retrieve T3_HW from error queue */
+        recvmsg(s, &msg_tx, MSG_ERRQUEUE);
+        tsc_errqueue = rdtsc();
+        get_ts(&msg_tx, &resp->hw_tx);
+
+        /* Calculate response latency: T3_HW - T2_HW */
+        int64_t signed_delta =
+            (resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
+            (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
+        if (signed_delta < 0) { negative_delta_count++; signed_delta = 0; }
+        resp->delta = (uint64_t)signed_delta;
+
+        packet_count++;
+
+        /* Start timing when warmup completes */
+        if (packet_count == cfg.warmup) {
+            test_start_tsc = rdtsc();
+            if (trace_marker_fd >= 0) {
+                char marker[128];
+                struct timespec now;
+                clock_gettime(CLOCK_TAI, &now);
+                snprintf(marker, sizeof(marker),
+                    "RANT_TEST_START reflect phc=%ld.%09ld sys=%ld.%09ld\n",
+                    resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec,
+                    now.tv_sec, now.tv_nsec);
+                write_trace_marker(marker);
+            }
+            if (verbose && cfg.warmup > 0)
+                fprintf(stderr, "✅ Warmup complete (%"PRIu64" packets), test started\n", cfg.warmup);
+            else if (verbose)
+                fprintf(stderr, "🚀 Test started\n");
+        }
+
+        if (packet_count <= cfg.warmup)
+            continue;
+
+        histogram_record(resp->delta, cfg);
+
+        if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
+            printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
+                   resp->delta, cfg.threshold);
+            printf("  T2_HW (NIC rx):  %ld.%09ld\n", resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec);
+            printf("  T3_HW (NIC tx):  %ld.%09ld\n", resp->hw_tx.tv_sec, resp->hw_tx.tv_nsec);
+            printf("  App processing (T3_SW - T2_SW): %"PRIu64" ns\n",
+                   (uint64_t)((resp->sw_tx - resp->sw_rx) * 1000000000ULL / cycles_per_sec));
+            printf("  --- RDTSC breakdown ---\n");
+            printf("    poll→recvmsg:     %"PRIu64" ns\n",
+                   (uint64_t)((tsc_recvmsg - tsc_poll) * 1000000000ULL / cycles_per_sec));
+            printf("    recvmsg→get_ts:   %"PRIu64" ns\n",
+                   (uint64_t)((tsc_get_ts - tsc_recvmsg) * 1000000000ULL / cycles_per_sec));
+            printf("    get_ts→sendto:    %"PRIu64" ns\n",
+                   (uint64_t)((tsc_sendto - tsc_get_ts) * 1000000000ULL / cycles_per_sec));
+            printf("    sendto→poll_tx:   %"PRIu64" ns\n",
+                   (uint64_t)((tsc_poll_tx - tsc_sendto) * 1000000000ULL / cycles_per_sec));
+            printf("    poll_tx→errqueue: %"PRIu64" ns\n",
+                   (uint64_t)((tsc_errqueue - tsc_poll_tx) * 1000000000ULL / cycles_per_sec));
+            printf("    total:            %"PRIu64" ns\n",
+                   (uint64_t)((tsc_errqueue - tsc_poll) * 1000000000ULL / cycles_per_sec));
+
+            if (trace_marker_fd >= 0) {
+                char trace_msg[256];
+                struct timespec now;
+                clock_gettime(CLOCK_TAI, &now);
+                snprintf(trace_msg, sizeof(trace_msg),
+                         "rant: Response threshold exceeded: seq=%"PRIu64" latency=%"PRIu64"ns"
+                         " phc=%ld.%09ld sys=%ld.%09ld\n",
+                         packet_count, resp->delta,
+                         resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec,
+                         now.tv_sec, now.tv_nsec);
+                write_trace_marker(trace_msg);
+            }
+            if (snapshot_fd >= 0)
+                write(snapshot_fd, "1", 1);
+            if (tracing_on_fd >= 0)
+                write(tracing_on_fd, "0", 1);
+
+            keep_running = 0;
+            break;
         }
 
         if (cfg.duration > 0 && rdtsc() > deadline)
             break;
     }
 
-done:;
     uint64_t duration_cycles = rdtsc() - test_start_tsc;
     printf("Test is complete. Duration: %.2f s\n", (double)duration_cycles / cycles_per_sec);
 }
@@ -741,12 +719,14 @@ void roundtrip_log(const char *filename) {
 
         for (size_t n = 0; n < count; n++) {
             size_t i = (start + n) % log_capacity;
-            fprintf(fp, "%10zu %20ld.%09ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %15lld\n",
+            uint64_t sw_tx_ns = rdtsc_to_tai_ns(log_book[i].sw_tx);
+            uint64_t sw_rx_ns = rdtsc_to_tai_ns(log_book[i].sw_rx);
+            fprintf(fp, "%10zu %20ld.%09ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %15"PRIu64"\n",
                 seq_base + n,
-                log_book[i].sw_tx.tv_sec, log_book[i].sw_tx.tv_nsec,
+                (long)(sw_tx_ns / 1000000000ULL), (long)(sw_tx_ns % 1000000000ULL),
                 log_book[i].hw_tx.tv_sec, log_book[i].hw_tx.tv_nsec,
                 log_book[i].hw_rx.tv_sec, log_book[i].hw_rx.tv_nsec,
-                log_book[i].sw_rx.tv_sec, log_book[i].sw_rx.tv_nsec,
+                (long)(sw_rx_ns / 1000000000ULL), (long)(sw_rx_ns % 1000000000ULL),
                 log_book[i].delta);
         }
     }
@@ -776,11 +756,13 @@ void response_log(const char *filename) {
 
         for (size_t n = 0; n < count; n++) {
             size_t i = (start + n) % log_capacity;
-            fprintf(fp, "%10zu %20ld.%09ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %15lld\n",
+            uint64_t sw_rx_ns = rdtsc_to_tai_ns(log_book[i].sw_rx);
+            uint64_t sw_tx_ns = rdtsc_to_tai_ns(log_book[i].sw_tx);
+            fprintf(fp, "%10zu %20ld.%09ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %15"PRIu64"\n",
                 seq_base + n,
                 log_book[i].hw_rx.tv_sec, log_book[i].hw_rx.tv_nsec,
-                log_book[i].sw_rx.tv_sec, log_book[i].sw_rx.tv_nsec,
-                log_book[i].sw_tx.tv_sec, log_book[i].sw_tx.tv_nsec,
+                (long)(sw_rx_ns / 1000000000ULL), (long)(sw_rx_ns % 1000000000ULL),
+                (long)(sw_tx_ns / 1000000000ULL), (long)(sw_tx_ns % 1000000000ULL),
                 log_book[i].hw_tx.tv_sec, log_book[i].hw_tx.tv_nsec,
                 log_book[i].delta);
         }
@@ -801,7 +783,6 @@ void print_usage(const char *progname) {
     printf("                                  Trace setup: echo 16384 > /sys/.../instances/rant/buffer_size_kb\n");
     printf("  -d, --duration <sec>          Test duration in seconds\n");
     printf("  -w, --warmup <pkts>           Number of warmup packets to discard\n");
-    printf("  -s, --sw-timestamps           Collect software timestamps\n");
     printf("  -H, --histogram               Show histogram summary\n");
     printf("  -l, --log <file>              Write transaction log to file\n");
     printf("  -o, --overflow <us>           Histogram overflow bucket threshold (default: 100us)\n");
@@ -819,7 +800,6 @@ int main(int argc, char **argv) {
         .iface = NULL,
         .ip = NULL,
         .threshold = 0,
-        .use_sw_timestamps = 0,
 	.show_histogram = 0,
 	.log_file = NULL,
 	.bucket_overflow = DEFAULT_BUCKET_OVERFLOW_NS,
@@ -848,7 +828,6 @@ int main(int argc, char **argv) {
         {"threshold",        required_argument, 0, 't'},
         {"trace-marker",     no_argument,       0, 'T'},
         {"snapshot",         no_argument,       0, 'S'},
-        {"sw-timestamps",    no_argument,       0, 's'},
         {"histogram",        no_argument,       0, 'H'},
         {"log",              required_argument, 0, 'l'},
         {"hugepages",        no_argument,       0, 'G'},
@@ -860,7 +839,7 @@ int main(int argc, char **argv) {
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSsHl:GB:Pvh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSHl:GB:Pvh", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -925,9 +904,6 @@ int main(int argc, char **argv) {
 	    case 'S':  // --snapshot
 		config.enable_snapshot = 1;
 		break;
-            case 's':
-                config.use_sw_timestamps = 1;
-                break;
 	    case 'H':
 		config.show_histogram = 1;
 		break;
@@ -987,7 +963,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  Warmup:         %"PRIu64" packets\n", config.warmup);
         if (config.threshold > 0)
             fprintf(stderr, "  Threshold:      %"PRIu64" us (stop on breach)\n", config.threshold / 1000);
-        fprintf(stderr, "  SW timestamps:  %s\n", config.use_sw_timestamps ? "yes" : "no");
         fprintf(stderr, "  Histogram:      %s (overflow: %"PRIu64" us, bucket: %"PRIu32" us)\n",
             config.show_histogram ? "yes" : "no",
             config.bucket_overflow / 1000, config.bucket_size / 1000);
