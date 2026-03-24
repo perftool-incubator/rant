@@ -426,9 +426,7 @@ void emit(config_t cfg) {
         /* Wait for TX timestamp (blocks until POLLPRI or signal) */
         msg_tx.msg_controllen = sizeof(cbuf_tx);
         msg_tx.msg_flags = 0;
-        while (poll(&pfd_tx, 1, -1) <= 0) {
-            if (!keep_running) break;
-        }
+        poll(&pfd_tx, 1, -1);
         if (!keep_running) break;
 
         /* Retrieve T1_HW from error queue */
@@ -440,9 +438,7 @@ void emit(config_t cfg) {
         /* Wait for pong (blocks until POLLIN or signal) */
         msg_rx.msg_controllen = sizeof(cbuf_rx);
         msg_rx.msg_flags = 0;
-        while (poll(&pfd_rx, 1, -1) <= 0) {
-            if (!keep_running) break;
-        }
+        poll(&pfd_rx, 1, -1);
         if (!keep_running) break;
 
         /* Receive Pong — T4_HW from cmsg, T4_SW from RDTSC */
@@ -588,9 +584,7 @@ void reflect(config_t cfg) {
         /* Wait for ping (blocks until POLLIN or signal) */
         msg_rx.msg_controllen = sizeof(cbuf_rx);
         msg_rx.msg_flags = 0;
-        while (poll(&pfd_rx, 1, -1) <= 0) {
-            if (!keep_running) break;
-        }
+        poll(&pfd_rx, 1, -1);
         if (!keep_running) break;
         tsc_poll = rdtsc();
 
@@ -609,9 +603,7 @@ void reflect(config_t cfg) {
         /* Wait for TX timestamp (blocks until POLLPRI or signal) */
         msg_tx.msg_controllen = sizeof(cbuf_tx);
         msg_tx.msg_flags = 0;
-        while (poll(&pfd_tx, 1, -1) <= 0) {
-            if (!keep_running) break;
-        }
+        poll(&pfd_tx, 1, -1);
         if (!keep_running) break;
         tsc_poll_tx = rdtsc();
 
