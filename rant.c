@@ -561,7 +561,7 @@ void reflect(config_t cfg) {
         fprintf(stderr, "\n⏳ Waiting for first packet...\n");
 
     /* RDTSC checkpoints for spike instrumentation */
-    uint64_t tsc_poll, tsc_recvmsg, tsc_get_ts, tsc_sendto, tsc_poll_tx, tsc_errqueue;
+    uint64_t tsc_before_poll, tsc_poll, tsc_recvmsg, tsc_get_ts, tsc_sendto, tsc_poll_tx, tsc_errqueue;
 
     while (keep_running) {
 
@@ -584,6 +584,7 @@ void reflect(config_t cfg) {
         /* Wait for ping (blocks until POLLIN or signal) */
         msg_rx.msg_controllen = sizeof(cbuf_rx);
         msg_rx.msg_flags = 0;
+        tsc_before_poll = rdtsc();
         poll(&pfd_rx, 1, -1);
         if (!keep_running) break;
         tsc_poll = rdtsc();
@@ -653,6 +654,8 @@ void reflect(config_t cfg) {
             printf("  App processing (T3_SW - T2_SW): %"PRIu64" ns\n",
                    (uint64_t)((resp->sw_tx - resp->sw_rx) * 1000000000ULL / cycles_per_sec));
             printf("  --- RDTSC breakdown ---\n");
+            printf("    before→poll:      %"PRIu64" ns\n",
+                   (uint64_t)((tsc_poll - tsc_before_poll) * 1000000000ULL / cycles_per_sec));
             printf("    poll→recvmsg:     %"PRIu64" ns\n",
                    (uint64_t)((tsc_recvmsg - tsc_poll) * 1000000000ULL / cycles_per_sec));
             printf("    recvmsg→get_ts:   %"PRIu64" ns\n",
@@ -664,7 +667,7 @@ void reflect(config_t cfg) {
             printf("    poll_tx→errqueue: %"PRIu64" ns\n",
                    (uint64_t)((tsc_errqueue - tsc_poll_tx) * 1000000000ULL / cycles_per_sec));
             printf("    total:            %"PRIu64" ns\n",
-                   (uint64_t)((tsc_errqueue - tsc_poll) * 1000000000ULL / cycles_per_sec));
+                   (uint64_t)((tsc_errqueue - tsc_before_poll) * 1000000000ULL / cycles_per_sec));
 
             if (trace_marker_fd >= 0) {
                 char trace_msg[256];
