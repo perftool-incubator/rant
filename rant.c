@@ -35,6 +35,8 @@ typedef struct {
     const char *iface;
     const char *ip;
     uint64_t threshold;
+    uint64_t log_threshold;
+    int threshold_continue;
     int show_histogram;
     const char *log_file;
     uint64_t bucket_overflow;
@@ -409,23 +411,8 @@ void emit(config_t cfg) {
                 fprintf(stderr, "✅ Warmup complete, test started\n");
         }
 
-        /* Only save to log_book after warmup and if logging enabled */
-        if (packet_count >= cfg.warmup && log_book != NULL) {
-            if (circular_log) {
-                rtt = &log_book[log_size % log_capacity];
-            } else if (log_size >= log_capacity) {
-                fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records)\n", log_capacity);
-                fprintf(stderr, "  Stopping test to prevent buffer overflow.\n");
-                fprintf(stderr, "  Consider using -d <seconds> for shorter tests or increase capacity.\n");
-                keep_running = 0;
-                break;
-            } else {
-                rtt = &log_book[log_size];
-            }
-            log_size++;
-        } else {
-            rtt = &warmup_record;
-        }
+        /* Use warmup_record as scratch; log_book write is deferred until after delta is known */
+        rtt = &warmup_record;
 
         /* T1_SW: RDTSC before sendto */
         rtt->sw_tx = rdtsc();
@@ -476,6 +463,18 @@ void emit(config_t cfg) {
         if (packet_count > cfg.warmup) {
             histogram_record(rtt->delta, cfg);
 
+            /* Save to log_book if logging enabled and delta exceeds log_threshold (or no log_threshold set) */
+            if (log_book != NULL && (cfg.log_threshold == 0 || rtt->delta > cfg.log_threshold)) {
+                if (circular_log) {
+                    log_book[log_size % log_capacity] = *rtt;
+                } else if (log_size < log_capacity) {
+                    log_book[log_size] = *rtt;
+                } else if (log_size == log_capacity) {
+                    fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records), further spikes not logged\n", log_capacity);
+                }
+                log_size++;
+            }
+
             if (cfg.threshold > 0 && rtt->delta > cfg.threshold) {
                 printf("Round-Trip latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
                        rtt->delta, cfg.threshold);
@@ -497,9 +496,10 @@ void emit(config_t cfg) {
                 if (tracing_on_fd >= 0)
                     write(tracing_on_fd, "0", 1);
 
-                /* exit early: threshold exceeded */
-                keep_running = 0;
-                break;
+                if (!cfg.threshold_continue) {
+                    keep_running = 0;
+                    break;
+                }
             }
         }
 
@@ -596,23 +596,10 @@ void reflect(config_t cfg) {
 
     while (keep_running) {
 
-        /* Allocate record */
-        if (packet_count >= cfg.warmup && log_book != NULL) {
-            if (circular_log) {
-                resp = &log_book[log_size % log_capacity];
-            } else if (log_size >= log_capacity) {
-                fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records)\n", log_capacity);
-                keep_running = 0;
-                break;
-            } else {
-                resp = &log_book[log_size];
-            }
-            log_size++;
-        } else {
-            resp = &warmup_record;
-        }
+        /* Use warmup_record as scratch; log_book write is deferred until after delta is known */
+        resp = &warmup_record;
 
-        /* Wait for ping (blocks until POLLIN or signal) */
+        /* Wait for ping (busy-polls via SO_BUSY_POLL, then dequeue) */
         msg_rx.msg_controllen = sizeof(cbuf_rx);
         msg_rx.msg_flags = 0;
         tsc_before_poll = rdtsc();
@@ -685,6 +672,18 @@ void reflect(config_t cfg) {
 
         histogram_record(resp->delta, cfg);
 
+        /* Save to log_book if logging enabled and delta exceeds log_threshold (or no log_threshold set) */
+        if (log_book != NULL && (cfg.log_threshold == 0 || resp->delta > cfg.log_threshold)) {
+            if (circular_log) {
+                log_book[log_size % log_capacity] = *resp;
+            } else if (log_size < log_capacity) {
+                log_book[log_size] = *resp;
+            } else if (log_size == log_capacity) {
+                fprintf(stderr, "\nWARNING: Log capacity exceeded (%zu records), further spikes not logged\n", log_capacity);
+            }
+            log_size++;
+        }
+
         if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
             printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
                    resp->delta, cfg.threshold);
@@ -726,8 +725,10 @@ void reflect(config_t cfg) {
             if (tracing_on_fd >= 0)
                 write(tracing_on_fd, "0", 1);
 
-            keep_running = 0;
-            break;
+            if (!cfg.threshold_continue) {
+                keep_running = 0;
+                break;
+            }
         }
 
         if (cfg.duration > 0 && rdtsc() > deadline)
@@ -812,6 +813,8 @@ void print_usage(const char *progname) {
     printf("Optional:\n");
     printf("  -a, --address <ip>            Server IP address (client mode)\n");
     printf("  -t, --threshold <us>          Stop when latency exceeds threshold (microseconds, after warmup)\n");
+    printf("  -C, --continue                Continue running after threshold breach (don't stop)\n");
+    printf("  -L, --log-threshold <us>      Only log packets exceeding this latency (microseconds)\n");
     printf("  -T, --trace-marker            Enable kernel trace_marker integration (stops tracing on threshold)\n");
     printf("  -S, --snapshot                Take ftrace snapshot on threshold breach.\n");
     printf("                                  With --log: uses circular buffer (~10s, 36MB)\n");
@@ -838,6 +841,8 @@ int main(int argc, char **argv) {
         .iface = NULL,
         .ip = NULL,
         .threshold = 0,
+        .log_threshold = 0,
+        .threshold_continue = 0,
 	.show_histogram = 0,
 	.log_file = NULL,
 	.bucket_overflow = DEFAULT_BUCKET_OVERFLOW_NS,
@@ -872,6 +877,8 @@ int main(int argc, char **argv) {
         {"budget",           required_argument, 0, 'B'},
         {"prefer-busypoll",  no_argument,       0, 'P'},
         {"verbose",          no_argument,       0, 'v'},
+        {"log-threshold",    required_argument, 0, 'L'},
+        {"continue",         no_argument,       0, 'C'},
         {"no-tx-ts",         no_argument,       0, 'N'},
         {"no-hw-ts",         no_argument,       0, 'R'},
         {"busy-poll-us",     required_argument, 0, 'p'},
@@ -880,7 +887,7 @@ int main(int argc, char **argv) {
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSHl:GB:PvNp:Rh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSHl:GB:PvL:CNp:Rh", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -967,6 +974,18 @@ int main(int argc, char **argv) {
 	    case 'v':  // --verbose
 		config.verbose = 1;
 		break;
+	    case 'L':  // --log-threshold
+		;
+		uint64_t log_thresh_us = atoll(optarg);
+		if (log_thresh_us <= 0) {
+		    fprintf(stdout, "Warning: Log threshold (us) <= 0: fallback to default.\n");
+		} else {
+		    config.log_threshold = log_thresh_us * 1000;
+		}
+		break;
+	    case 'C':  // --continue
+		config.threshold_continue = 1;
+		break;
 	    case 'N':  // --no-tx-ts
 		config.no_tx_ts = 1;
 		break;
@@ -1013,7 +1032,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\n");
         fprintf(stderr, "  Warmup:         %"PRIu64" packets\n", config.warmup);
         if (config.threshold > 0)
-            fprintf(stderr, "  Threshold:      %"PRIu64" us (stop on breach)\n", config.threshold / 1000);
+            fprintf(stderr, "  Threshold:      %"PRIu64" us (%s)\n", config.threshold / 1000,
+                config.threshold_continue ? "continue" : "stop on breach");
+        if (config.log_threshold > 0)
+            fprintf(stderr, "  Log threshold:  %"PRIu64" us (only log spikes)\n", config.log_threshold / 1000);
         fprintf(stderr, "  Histogram:      %s (overflow: %"PRIu64" us, bucket: %"PRIu32" us)\n",
             config.show_histogram ? "yes" : "no",
             config.bucket_overflow / 1000, config.bucket_size / 1000);
@@ -1052,6 +1074,21 @@ int main(int argc, char **argv) {
         if (verbose)
             fprintf(stderr, "📦 Log: circular buffer %zu records (~10s, %.1f MB)\n",
                 log_capacity, log_book_bytes / (1024.0 * 1024.0));
+
+        log_book = calloc(log_capacity, sizeof(struct record));
+        if (log_book == NULL) {
+            perror("calloc failed");
+            return 1;
+        }
+        using_hugepages = 0;
+    } else if (config.log_threshold > 0) {
+        /* Log-threshold mode: only spikes are recorded, use small fixed buffer */
+        log_capacity = 1000000;  /* 1M spike records — enough for days of testing */
+        log_book_bytes = log_capacity * sizeof(struct record);
+
+        if (verbose)
+            fprintf(stderr, "📦 Log: spike-only buffer %zu records (%.1f MB, threshold > %"PRIu64" us)\n",
+                log_capacity, log_book_bytes / (1024.0 * 1024.0), config.log_threshold / 1000);
 
         log_book = calloc(log_capacity, sizeof(struct record));
         if (log_book == NULL) {
