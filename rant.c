@@ -393,6 +393,9 @@ void emit(config_t cfg) {
     else if (verbose)
         fprintf(stderr, "\n🚀 Test started\n");
 
+    /* RDTSC breakdown checkpoints for client */
+    uint64_t tsc_pre_sendto, tsc_sendto, tsc_poll_tx, tsc_errqueue, tsc_pre_poll_rx, tsc_poll_rx, tsc_pre_recvmsg, tsc_recvmsg;
+
     while (keep_running) {
 
         /* Start timing when warmup completes, before first test packet */
@@ -416,9 +419,11 @@ void emit(config_t cfg) {
 
         /* T1_SW: RDTSC before sendto */
         rtt->sw_tx = rdtsc();
+        tsc_pre_sendto = rtt->sw_tx;
 
         /* Send Ping */
         sendto(s, buf_tx, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
+        tsc_sendto = rdtsc();
 
         if (!cfg.no_hw_ts) {
             /* Wait for TX timestamp (blocks until POLLPRI or signal) */
@@ -426,23 +431,32 @@ void emit(config_t cfg) {
             msg_tx.msg_flags = 0;
             poll(&pfd_tx, 1, -1);
             if (!keep_running) break;
+            tsc_poll_tx = rdtsc();
 
             /* Retrieve T1_HW from error queue */
             rtt->hw_tx.tv_sec = 0;
             rtt->hw_tx.tv_nsec = 0;
             recvmsg(s, &msg_tx, MSG_ERRQUEUE);
+            tsc_errqueue = rdtsc();
             get_ts(&msg_tx, &rtt->hw_tx);
+        } else {
+            tsc_poll_tx = tsc_sendto;
+            tsc_errqueue = tsc_sendto;
         }
 
         /* Wait for pong (blocks until POLLIN or signal) */
         msg_rx.msg_controllen = sizeof(cbuf_rx);
         msg_rx.msg_flags = 0;
+        tsc_pre_poll_rx = rdtsc();
         poll(&pfd_rx, 1, -1);
         if (!keep_running) break;
+        tsc_poll_rx = rdtsc();
 
         /* Receive Pong — T4_HW from cmsg, T4_SW from RDTSC */
+        tsc_pre_recvmsg = rdtsc();
         recvmsg(s, &msg_rx, 0);
-        rtt->sw_rx = rdtsc();
+        tsc_recvmsg = rdtsc();
+        rtt->sw_rx = tsc_recvmsg;
         if (!cfg.no_hw_ts) {
             get_ts(&msg_rx, &rtt->hw_rx);
         }
@@ -456,7 +470,7 @@ void emit(config_t cfg) {
             rtt->delta = (uint64_t)signed_rtt;
         } else {
             /* RDTSC-only: RTT = T4_SW - T1_SW */
-            rtt->delta = (uint64_t)((rtt->sw_rx - rtt->sw_tx) * 1000000000ULL / cycles_per_sec);
+            rtt->delta = (uint64_t)((tsc_recvmsg - tsc_pre_sendto) * 1000000000ULL / cycles_per_sec);
         }
 
         packet_count++;
@@ -482,6 +496,21 @@ void emit(config_t cfg) {
                 printf("  T4_HW (NIC rx):  %ld.%09ld\n", rtt->hw_rx.tv_sec, rtt->hw_rx.tv_nsec);
                 printf("  T1_SW (RDTSC):   %"PRIu64"\n", rtt->sw_tx);
                 printf("  T4_SW (RDTSC):   %"PRIu64"\n", rtt->sw_rx);
+                printf("  --- RDTSC breakdown ---\n");
+                printf("    sendto syscall:     %"PRIu64" ns\n",
+                       (uint64_t)((tsc_sendto - tsc_pre_sendto) * 1000000000ULL / cycles_per_sec));
+                printf("    sendto→poll_tx:     %"PRIu64" ns\n",
+                       (uint64_t)((tsc_poll_tx - tsc_sendto) * 1000000000ULL / cycles_per_sec));
+                printf("    poll_tx→errqueue:   %"PRIu64" ns\n",
+                       (uint64_t)((tsc_errqueue - tsc_poll_tx) * 1000000000ULL / cycles_per_sec));
+                printf("    errqueue→poll_rx:   %"PRIu64" ns\n",
+                       (uint64_t)((tsc_poll_rx - tsc_errqueue) * 1000000000ULL / cycles_per_sec));
+                printf("    poll_rx→recvmsg:    %"PRIu64" ns\n",
+                       (uint64_t)((tsc_pre_recvmsg - tsc_poll_rx) * 1000000000ULL / cycles_per_sec));
+                printf("    recvmsg syscall:    %"PRIu64" ns\n",
+                       (uint64_t)((tsc_recvmsg - tsc_pre_recvmsg) * 1000000000ULL / cycles_per_sec));
+                printf("    total:              %"PRIu64" ns\n",
+                       (uint64_t)((tsc_recvmsg - tsc_pre_sendto) * 1000000000ULL / cycles_per_sec));
 
                 /* Write to trace_marker for kernel tracing correlation */
                 if (trace_marker_fd >= 0) {
@@ -592,7 +621,8 @@ void reflect(config_t cfg) {
         fprintf(stderr, "\n⏳ Waiting for first packet...\n");
 
     /* RDTSC checkpoints for spike instrumentation */
-    uint64_t tsc_before_poll, tsc_poll, tsc_recvmsg, tsc_get_ts, tsc_sendto, tsc_poll_tx, tsc_errqueue;
+    uint64_t tsc_before_poll, tsc_poll, tsc_pre_recvmsg, tsc_recvmsg, tsc_get_ts, tsc_pre_sendto, tsc_sendto, tsc_poll_tx, tsc_errqueue;
+    uint64_t tsc_prev_loop_end = 0;  /* When previous iteration finished */
 
     while (keep_running) {
 
@@ -608,6 +638,7 @@ void reflect(config_t cfg) {
         tsc_poll = rdtsc();
 
         /* Receive ping — T2_HW from cmsg, T2_SW from RDTSC */
+        tsc_pre_recvmsg = rdtsc();
         recvmsg(s, &msg_rx, 0);
         tsc_recvmsg = rdtsc();
         resp->sw_rx = tsc_recvmsg;
@@ -617,6 +648,7 @@ void reflect(config_t cfg) {
 
         /* Send pong — T3_SW from RDTSC */
         resp->sw_tx = rdtsc();
+        tsc_pre_sendto = rdtsc();
         sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
         tsc_sendto = rdtsc();
 
@@ -693,19 +725,28 @@ void reflect(config_t cfg) {
             printf("  App processing (T3_SW - T2_SW): %"PRIu64" ns\n",
                    (uint64_t)((resp->sw_tx - resp->sw_rx) * 1000000000ULL / cycles_per_sec));
             printf("  --- RDTSC breakdown ---\n");
-            printf("    before→poll:      %"PRIu64" ns\n",
+            if (tsc_prev_loop_end > 0)
+                printf("    prev_end→poll_start: %"PRIu64" ns\n",
+                       (uint64_t)((tsc_before_poll - tsc_prev_loop_end) * 1000000000ULL / cycles_per_sec));
+            printf("    before→poll:        %"PRIu64" ns\n",
                    (uint64_t)((tsc_poll - tsc_before_poll) * 1000000000ULL / cycles_per_sec));
-            printf("    poll→recvmsg:     %"PRIu64" ns\n",
-                   (uint64_t)((tsc_recvmsg - tsc_poll) * 1000000000ULL / cycles_per_sec));
-            printf("    recvmsg→get_ts:   %"PRIu64" ns\n",
+            printf("    poll→pre_recvmsg:   %"PRIu64" ns\n",
+                   (uint64_t)((tsc_pre_recvmsg - tsc_poll) * 1000000000ULL / cycles_per_sec));
+            printf("    recvmsg syscall:    %"PRIu64" ns\n",
+                   (uint64_t)((tsc_recvmsg - tsc_pre_recvmsg) * 1000000000ULL / cycles_per_sec));
+            printf("    recvmsg→get_ts:     %"PRIu64" ns\n",
                    (uint64_t)((tsc_get_ts - tsc_recvmsg) * 1000000000ULL / cycles_per_sec));
-            printf("    get_ts→sendto:    %"PRIu64" ns\n",
-                   (uint64_t)((tsc_sendto - tsc_get_ts) * 1000000000ULL / cycles_per_sec));
-            printf("    sendto→poll_tx:   %"PRIu64" ns\n",
-                   (uint64_t)((tsc_poll_tx - tsc_sendto) * 1000000000ULL / cycles_per_sec));
-            printf("    poll_tx→errqueue: %"PRIu64" ns\n",
-                   (uint64_t)((tsc_errqueue - tsc_poll_tx) * 1000000000ULL / cycles_per_sec));
-            printf("    total:            %"PRIu64" ns\n",
+            printf("    get_ts→pre_sendto:  %"PRIu64" ns\n",
+                   (uint64_t)((tsc_pre_sendto - tsc_get_ts) * 1000000000ULL / cycles_per_sec));
+            printf("    sendto syscall:     %"PRIu64" ns\n",
+                   (uint64_t)((tsc_sendto - tsc_pre_sendto) * 1000000000ULL / cycles_per_sec));
+            if (!cfg.no_tx_ts) {
+                printf("    sendto→poll_tx:     %"PRIu64" ns\n",
+                       (uint64_t)((tsc_poll_tx - tsc_sendto) * 1000000000ULL / cycles_per_sec));
+                printf("    poll_tx→errqueue:   %"PRIu64" ns\n",
+                       (uint64_t)((tsc_errqueue - tsc_poll_tx) * 1000000000ULL / cycles_per_sec));
+            }
+            printf("    total:              %"PRIu64" ns\n",
                    (uint64_t)((tsc_errqueue - tsc_before_poll) * 1000000000ULL / cycles_per_sec));
 
             if (trace_marker_fd >= 0) {
@@ -731,7 +772,9 @@ void reflect(config_t cfg) {
             }
         }
 
-        if (cfg.duration > 0 && rdtsc() > deadline)
+        tsc_prev_loop_end = rdtsc();
+
+        if (cfg.duration > 0 && tsc_prev_loop_end > deadline)
             break;
     }
 
