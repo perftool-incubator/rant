@@ -248,9 +248,34 @@ tuna isolate -c "$cpu,$irq_cpu"
 comp_thread=$(pgrep -f "mlx5_comp0${irq_pattern}" | head -1)
 async_thread=$(pgrep -f "mlx5_async0${irq_pattern}" | head -1)
 
+# Helper: pin IRQ thread to a CPU. Tries taskset first, falls back to
+# /proc/irq/<n>/smp_affinity_list (needed on kernel 7.0+ where IRQ threads
+# have PF_NO_SETAFFINITY and taskset silently fails or errors out).
+pin_irq_thread() {
+    local pid=$1 target_cpu=$2
+    # Try taskset first
+    if taskset -p -c "$target_cpu" "$pid" 2>/dev/null; then
+        # Verify it actually moved
+        local cur=$(ps -o psr= -p "$pid" 2>/dev/null | tr -d ' ')
+        if [[ "$cur" == "$target_cpu" ]]; then
+            return 0
+        fi
+    fi
+    # Fallback: extract IRQ number from thread name (e.g. "irq/940-mlx5_comp0...")
+    local comm
+    comm=$(cat /proc/$pid/comm 2>/dev/null)
+    local irq_num=${comm#irq/}
+    irq_num=${irq_num%%-*}
+    if [[ "$irq_num" =~ ^[0-9]+$ ]] && [[ -f /proc/irq/$irq_num/smp_affinity_list ]]; then
+        echo "$target_cpu" > /proc/irq/$irq_num/smp_affinity_list 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
 if [[ -n "$comp_thread" ]]; then
     # Set comp0 (data path) to high priority and pin to IRQ CPU
-    taskset -p -c "$irq_cpu" "$comp_thread"
+    pin_irq_thread "$comp_thread" "$irq_cpu"
     chrt -f -p "$irq_prio" "$comp_thread"
     { set +x; } 2>/dev/null
     echo ""
@@ -265,7 +290,7 @@ fi
 
 if [[ -n "$async_thread" ]]; then
     # Set async0 (firmware events) priority
-    taskset -p -c "$irq_cpu" "$async_thread"
+    pin_irq_thread "$async_thread" "$irq_cpu"
     chrt -f -p "$ksoftirqd_prio" "$async_thread"
     { set +x; } 2>/dev/null
     echo "=== mlx5_async0 (firmware events) ==="
