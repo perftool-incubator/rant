@@ -41,12 +41,15 @@ typedef struct {
     uint32_t bucket_size;
     uint64_t duration;
     uint64_t warmup;
+    int busy_poll_us;
     int busy_poll_budget;
     int prefer_busy_poll;
     int use_hugepages;
     int enable_trace_marker;
     int enable_snapshot;
     int verbose;
+    int no_tx_ts;
+    int no_hw_ts;
 } config_t;
 
 uint64_t *histogram = NULL;
@@ -319,14 +322,21 @@ void emit(config_t cfg) {
 
     /* Socket options including Hardware Timestamping */
     int s = socket(AF_INET, SOCK_DGRAM, 0);
-    struct ifreq ifr; strncpy(ifr.ifr_name, cfg.iface, IFNAMSIZ);
-    struct hwtstamp_config hw_cfg = { .tx_type = HWTSTAMP_TX_ON, .rx_filter = HWTSTAMP_FILTER_ALL };
-    ifr.ifr_data = (char *)&hw_cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
+    if (!cfg.no_hw_ts) {
+        struct ifreq ifr; strncpy(ifr.ifr_name, cfg.iface, IFNAMSIZ);
+        struct hwtstamp_config hw_cfg = { .tx_type = HWTSTAMP_TX_ON, .rx_filter = HWTSTAMP_FILTER_ALL };
+        ifr.ifr_data = (char *)&hw_cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
 
-    int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
-    setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
+        int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
+        setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
+    }
 
     /* Set busy poll socket options if configured */
+    if (cfg.busy_poll_us > 0) {
+        if (setsockopt(s, SOL_SOCKET, SO_BUSY_POLL, &cfg.busy_poll_us, sizeof(cfg.busy_poll_us)) < 0) {
+            perror("setsockopt SO_BUSY_POLL");
+        }
+    }
     if (cfg.busy_poll_budget > 0) {
         if (setsockopt(s, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &cfg.busy_poll_budget, sizeof(cfg.busy_poll_budget)) < 0) {
             perror("setsockopt SO_BUSY_POLL_BUDGET");
@@ -423,17 +433,19 @@ void emit(config_t cfg) {
         /* Send Ping */
         sendto(s, buf_tx, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
 
-        /* Wait for TX timestamp (blocks until POLLPRI or signal) */
-        msg_tx.msg_controllen = sizeof(cbuf_tx);
-        msg_tx.msg_flags = 0;
-        poll(&pfd_tx, 1, -1);
-        if (!keep_running) break;
+        if (!cfg.no_hw_ts) {
+            /* Wait for TX timestamp (blocks until POLLPRI or signal) */
+            msg_tx.msg_controllen = sizeof(cbuf_tx);
+            msg_tx.msg_flags = 0;
+            poll(&pfd_tx, 1, -1);
+            if (!keep_running) break;
 
-        /* Retrieve T1_HW from error queue */
-        rtt->hw_tx.tv_sec = 0;
-        rtt->hw_tx.tv_nsec = 0;
-        recvmsg(s, &msg_tx, MSG_ERRQUEUE);
-        get_ts(&msg_tx, &rtt->hw_tx);
+            /* Retrieve T1_HW from error queue */
+            rtt->hw_tx.tv_sec = 0;
+            rtt->hw_tx.tv_nsec = 0;
+            recvmsg(s, &msg_tx, MSG_ERRQUEUE);
+            get_ts(&msg_tx, &rtt->hw_tx);
+        }
 
         /* Wait for pong (blocks until POLLIN or signal) */
         msg_rx.msg_controllen = sizeof(cbuf_rx);
@@ -444,14 +456,21 @@ void emit(config_t cfg) {
         /* Receive Pong — T4_HW from cmsg, T4_SW from RDTSC */
         recvmsg(s, &msg_rx, 0);
         rtt->sw_rx = rdtsc();
-        get_ts(&msg_rx, &rtt->hw_rx);
+        if (!cfg.no_hw_ts) {
+            get_ts(&msg_rx, &rtt->hw_rx);
+        }
 
-        /* Calculate Round Trip Time latency: T4_HW - T1_HW */
-        int64_t signed_rtt =
-            (rtt->hw_rx.tv_sec - rtt->hw_tx.tv_sec) * 1000000000LL +
-            (rtt->hw_rx.tv_nsec - rtt->hw_tx.tv_nsec);
-        if (signed_rtt < 0) { negative_delta_count++; signed_rtt = 0; }
-        rtt->delta = (uint64_t)signed_rtt;
+        if (!cfg.no_hw_ts) {
+            /* Calculate Round Trip Time latency: T4_HW - T1_HW */
+            int64_t signed_rtt =
+                (rtt->hw_rx.tv_sec - rtt->hw_tx.tv_sec) * 1000000000LL +
+                (rtt->hw_rx.tv_nsec - rtt->hw_tx.tv_nsec);
+            if (signed_rtt < 0) { negative_delta_count++; signed_rtt = 0; }
+            rtt->delta = (uint64_t)signed_rtt;
+        } else {
+            /* RDTSC-only: RTT = T4_SW - T1_SW */
+            rtt->delta = (uint64_t)((rtt->sw_rx - rtt->sw_tx) * 1000000000ULL / cycles_per_sec);
+        }
 
         packet_count++;
         if (packet_count > cfg.warmup) {
@@ -498,14 +517,26 @@ void reflect(config_t cfg) {
 
     /* Socket options including Hardware Timestamping */
     int s = socket(AF_INET, SOCK_DGRAM, 0);
-    struct ifreq ifr; strncpy(ifr.ifr_name, cfg.iface, IFNAMSIZ);
-    struct hwtstamp_config hw_cfg = { .tx_type = HWTSTAMP_TX_ON, .rx_filter = HWTSTAMP_FILTER_ALL };
-    ifr.ifr_data = (char *)&hw_cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
+    if (!cfg.no_hw_ts) {
+        struct ifreq ifr; strncpy(ifr.ifr_name, cfg.iface, IFNAMSIZ);
+        struct hwtstamp_config hw_cfg = {
+            .tx_type = cfg.no_tx_ts ? HWTSTAMP_TX_OFF : HWTSTAMP_TX_ON,
+            .rx_filter = HWTSTAMP_FILTER_ALL
+        };
+        ifr.ifr_data = (char *)&hw_cfg; ioctl(s, SIOCSHWTSTAMP, &ifr);
 
-    int flags = SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
-    setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
+        int flags = SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RAW_HARDWARE;
+        if (!cfg.no_tx_ts)
+            flags |= SOF_TIMESTAMPING_TX_HARDWARE;
+        setsockopt(s, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
+    }
 
     /* Set busy poll socket options if configured */
+    if (cfg.busy_poll_us > 0) {
+        if (setsockopt(s, SOL_SOCKET, SO_BUSY_POLL, &cfg.busy_poll_us, sizeof(cfg.busy_poll_us)) < 0) {
+            perror("setsockopt SO_BUSY_POLL");
+        }
+    }
     if (cfg.busy_poll_budget > 0) {
         if (setsockopt(s, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &cfg.busy_poll_budget, sizeof(cfg.busy_poll_budget)) < 0) {
             perror("setsockopt SO_BUSY_POLL_BUDGET");
@@ -593,7 +624,8 @@ void reflect(config_t cfg) {
         recvmsg(s, &msg_rx, 0);
         tsc_recvmsg = rdtsc();
         resp->sw_rx = tsc_recvmsg;
-        get_ts(&msg_rx, &resp->hw_rx);
+        if (!cfg.no_hw_ts)
+            get_ts(&msg_rx, &resp->hw_rx);
         tsc_get_ts = rdtsc();
 
         /* Send pong — T3_SW from RDTSC */
@@ -601,24 +633,31 @@ void reflect(config_t cfg) {
         sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
         tsc_sendto = rdtsc();
 
-        /* Wait for TX timestamp (blocks until POLLPRI or signal) */
-        msg_tx.msg_controllen = sizeof(cbuf_tx);
-        msg_tx.msg_flags = 0;
-        poll(&pfd_tx, 1, -1);
-        if (!keep_running) break;
-        tsc_poll_tx = rdtsc();
+        if (!cfg.no_tx_ts) {
+            /* Wait for TX timestamp (blocks until POLLPRI or signal) */
+            msg_tx.msg_controllen = sizeof(cbuf_tx);
+            msg_tx.msg_flags = 0;
+            poll(&pfd_tx, 1, -1);
+            if (!keep_running) break;
+            tsc_poll_tx = rdtsc();
 
-        /* Retrieve T3_HW from error queue */
-        recvmsg(s, &msg_tx, MSG_ERRQUEUE);
-        tsc_errqueue = rdtsc();
-        get_ts(&msg_tx, &resp->hw_tx);
+            /* Retrieve T3_HW from error queue */
+            recvmsg(s, &msg_tx, MSG_ERRQUEUE);
+            tsc_errqueue = rdtsc();
+            get_ts(&msg_tx, &resp->hw_tx);
 
-        /* Calculate response latency: T3_HW - T2_HW */
-        int64_t signed_delta =
-            (resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
-            (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
-        if (signed_delta < 0) { negative_delta_count++; signed_delta = 0; }
-        resp->delta = (uint64_t)signed_delta;
+            /* Calculate response latency: T3_HW - T2_HW */
+            int64_t signed_delta =
+                (resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
+                (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
+            if (signed_delta < 0) { negative_delta_count++; signed_delta = 0; }
+            resp->delta = (uint64_t)signed_delta;
+        } else {
+            /* No TX timestamp — use RDTSC delta as approximate response time */
+            tsc_poll_tx = tsc_sendto;
+            tsc_errqueue = tsc_sendto;
+            resp->delta = (uint64_t)((tsc_sendto - tsc_recvmsg) * 1000000000ULL / cycles_per_sec);
+        }
 
         packet_count++;
 
@@ -650,7 +689,8 @@ void reflect(config_t cfg) {
             printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
                    resp->delta, cfg.threshold);
             printf("  T2_HW (NIC rx):  %ld.%09ld\n", resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec);
-            printf("  T3_HW (NIC tx):  %ld.%09ld\n", resp->hw_tx.tv_sec, resp->hw_tx.tv_nsec);
+            if (!cfg.no_tx_ts)
+                printf("  T3_HW (NIC tx):  %ld.%09ld\n", resp->hw_tx.tv_sec, resp->hw_tx.tv_nsec);
             printf("  App processing (T3_SW - T2_SW): %"PRIu64" ns\n",
                    (uint64_t)((resp->sw_tx - resp->sw_rx) * 1000000000ULL / cycles_per_sec));
             printf("  --- RDTSC breakdown ---\n");
@@ -783,9 +823,12 @@ void print_usage(const char *progname) {
     printf("  -o, --overflow <us>           Histogram overflow bucket threshold (default: 100us)\n");
     printf("  -b, --bucket-size <us>        Histogram bucket size (default: 1us)\n");
     printf("  -G, --hugepages               Use hugepages for memory allocation (requires system config)\n");
+    printf("  -p, --busy-poll-us <us>       Set SO_BUSY_POLL per-socket timeout (microseconds)\n");
     printf("  -B, --budget <budget>         Set SO_BUSY_POLL_BUDGET (NAPI poll budget)\n");
     printf("  -P, --prefer-busypoll         Set SO_PREFER_BUSY_POLL (prefer busy poll over interrupt)\n");
     printf("  -v, --verbose                 Verbose output (show config, allocation, progress)\n");
+    printf("  -N, --no-tx-ts                Skip TX timestamp retrieval (server only, reduces latency)\n");
+    printf("  -R, --no-hw-ts                Disable all HW timestamps, use RDTSC only for T1/T2/T3/T4\n");
     printf("  -h, --help                    Show this help message\n");
 }
 
@@ -829,12 +872,15 @@ int main(int argc, char **argv) {
         {"budget",           required_argument, 0, 'B'},
         {"prefer-busypoll",  no_argument,       0, 'P'},
         {"verbose",          no_argument,       0, 'v'},
+        {"no-tx-ts",         no_argument,       0, 'N'},
+        {"no-hw-ts",         no_argument,       0, 'R'},
+        {"busy-poll-us",     required_argument, 0, 'p'},
         {"help",             no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSHl:GB:Pvh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSHl:GB:PvNp:Rh", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -920,6 +966,16 @@ int main(int argc, char **argv) {
 		break;
 	    case 'v':  // --verbose
 		config.verbose = 1;
+		break;
+	    case 'N':  // --no-tx-ts
+		config.no_tx_ts = 1;
+		break;
+	    case 'R':  // --no-hw-ts
+		config.no_hw_ts = 1;
+		config.no_tx_ts = 1;  /* implies no TX timestamps too */
+		break;
+	    case 'p':  // --busy-poll-us
+		config.busy_poll_us = atoi(optarg);
 		break;
 	    case 'h':
 		print_usage(argv[0]);
