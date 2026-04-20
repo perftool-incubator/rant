@@ -18,6 +18,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
 
 #ifndef SO_PREFER_BUSY_POLL
 #define SO_PREFER_BUSY_POLL 69
@@ -50,6 +52,7 @@ typedef struct {
     int enable_trace_marker;
     int enable_snapshot;
     int verbose;
+    int enable_pmc;
     int no_tx_ts;
     int no_hw_ts;
 } config_t;
@@ -140,6 +143,109 @@ static inline uint64_t rdtsc_to_tai_ns(uint64_t tsc) {
     int64_t delta_cycles = (int64_t)(tsc - rdtsc_ref);
     int64_t delta_ns = delta_cycles * (int64_t)1000000000LL / (int64_t)cycles_per_sec;
     return tai_ref_ns + delta_ns;
+}
+
+/* --- Hardware Performance Counter (PMC) support via rdpmc --- */
+
+#define PMC_MAX 3
+
+struct pmc_counter {
+    const char *name;
+    uint64_t raw_config;
+    int fd;
+    uint32_t index;  /* rdpmc counter index */
+    struct perf_event_mmap_page *page;
+};
+
+static int pmc_count = 0;
+static struct pmc_counter pmc_counters[PMC_MAX];
+
+/* Default PMC events for Sapphire Rapids */
+static struct {
+    const char *name;
+    uint64_t config;
+} pmc_default_events[PMC_MAX] = {
+    { "L1d_miss",        0x000008d1 },  /* MEM_LOAD_RETIRED.L1_MISS */
+    { "icache_stl",      0x00000480 },  /* ICACHE_DATA.STALLS */
+    { "cycles",          0x0000003c },  /* CPU_CLK_UNHALTED.THREAD */
+};
+
+static long sys_perf_event_open(struct perf_event_attr *attr, pid_t pid,
+                                int cpu, int group_fd, unsigned long flags) {
+    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
+
+/* Set up PMC counters for the calling thread. Returns number of active counters. */
+static int pmc_setup(void) {
+    pmc_count = 0;
+
+    for (int i = 0; i < PMC_MAX; i++) {
+        struct perf_event_attr attr = {0};
+        attr.type = PERF_TYPE_RAW;
+        attr.size = sizeof(attr);
+        attr.config = pmc_default_events[i].config;
+        attr.disabled = 0;
+        attr.exclude_kernel = 0;
+        attr.exclude_user = 0;
+        attr.pinned = 1;
+
+        int fd = sys_perf_event_open(&attr, 0, -1, -1, 0);
+        if (fd < 0) {
+            fprintf(stderr, "Warning: Cannot open PMC '%s' (config=0x%"PRIx64"): %s\n",
+                    pmc_default_events[i].name, pmc_default_events[i].config,
+                    strerror(errno));
+            continue;
+        }
+
+        struct perf_event_mmap_page *page = mmap(NULL, 4096,
+            PROT_READ, MAP_SHARED, fd, 0);
+        if (page == MAP_FAILED) {
+            fprintf(stderr, "Warning: Cannot mmap PMC '%s': %s\n",
+                    pmc_default_events[i].name, strerror(errno));
+            close(fd);
+            continue;
+        }
+
+        if (page->index == 0) {
+            fprintf(stderr, "Warning: PMC '%s' has no counter index (rdpmc not available)\n",
+                    pmc_default_events[i].name);
+            munmap(page, 4096);
+            close(fd);
+            continue;
+        }
+
+        pmc_counters[pmc_count].name = pmc_default_events[i].name;
+        pmc_counters[pmc_count].raw_config = pmc_default_events[i].config;
+        pmc_counters[pmc_count].fd = fd;
+        pmc_counters[pmc_count].index = page->index - 1;
+        pmc_counters[pmc_count].page = page;
+        pmc_count++;
+    }
+
+    return pmc_count;
+}
+
+static void pmc_cleanup(void) {
+    for (int i = 0; i < pmc_count; i++) {
+        if (pmc_counters[i].page)
+            munmap(pmc_counters[i].page, 4096);
+        if (pmc_counters[i].fd >= 0)
+            close(pmc_counters[i].fd);
+    }
+    pmc_count = 0;
+}
+
+/* Read a single PMC — one rdpmc instruction, ~20ns */
+static inline uint64_t read_pmc(int idx) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdpmc" : "=a"(lo), "=d"(hi) : "c"(pmc_counters[idx].index));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* Snapshot all active PMC counters into an array */
+static inline void pmc_snapshot(uint64_t *vals) {
+    for (int i = 0; i < pmc_count; i++)
+        vals[i] = read_pmc(i);
 }
 
 /* Try to open a tracefs file, checking multiple paths */
@@ -610,6 +716,16 @@ void reflect(config_t cfg) {
     calibrate_rdtsc();
     if (verbose)
         fprintf(stderr, "✅ RDTSC: %"PRIu64" cycles/sec, anchored to TAI\n", cycles_per_sec);
+
+    /* Set up PMC counters if enabled */
+    if (cfg.enable_pmc) {
+        int n = pmc_setup();
+        if (n > 0)
+            fprintf(stderr, "✅ PMC: %d counters active (rdpmc)\n", n);
+        else
+            fprintf(stderr, "Warning: No PMC counters available. Continuing without PMC.\n");
+    }
+
     uint64_t start_tsc = rdtsc();
     uint64_t test_start_tsc = start_tsc;
     uint64_t deadline = cfg.duration > 0 ? start_tsc + (cfg.duration * cycles_per_sec): 0;
@@ -624,6 +740,15 @@ void reflect(config_t cfg) {
     uint64_t tsc_before_poll, tsc_poll, tsc_pre_recvmsg, tsc_recvmsg, tsc_get_ts, tsc_pre_sendto, tsc_sendto, tsc_poll_tx, tsc_errqueue;
     uint64_t tsc_prev_loop_end = 0;  /* When previous iteration finished */
 
+    /* PMC checkpoints for per-syscall counter deltas */
+    uint64_t pmc_pre_poll[PMC_MAX], pmc_post_poll[PMC_MAX];
+    uint64_t pmc_pre_recvmsg[PMC_MAX], pmc_post_recvmsg[PMC_MAX];
+    uint64_t pmc_pre_sendto[PMC_MAX], pmc_post_sendto[PMC_MAX];
+
+    /* Fast-path PMC accumulators for comparison (<20us = fast) */
+    uint64_t pmc_fast_poll_sum[PMC_MAX] = {0}, pmc_fast_recvmsg_sum[PMC_MAX] = {0}, pmc_fast_sendto_sum[PMC_MAX] = {0};
+    uint64_t pmc_fast_count = 0;
+
     while (keep_running) {
 
         /* Use warmup_record as scratch; log_book write is deferred until after delta is known */
@@ -632,15 +757,19 @@ void reflect(config_t cfg) {
         /* Wait for ping (busy-polls via SO_BUSY_POLL, then dequeue) */
         msg_rx.msg_controllen = sizeof(cbuf_rx);
         msg_rx.msg_flags = 0;
+        pmc_snapshot(pmc_pre_poll);
         tsc_before_poll = rdtsc();
         poll(&pfd_rx, 1, -1);
         if (!keep_running) break;
         tsc_poll = rdtsc();
+        pmc_snapshot(pmc_post_poll);
 
         /* Receive ping — T2_HW from cmsg, T2_SW from RDTSC */
+        pmc_snapshot(pmc_pre_recvmsg);
         tsc_pre_recvmsg = rdtsc();
         recvmsg(s, &msg_rx, 0);
         tsc_recvmsg = rdtsc();
+        pmc_snapshot(pmc_post_recvmsg);
         resp->sw_rx = tsc_recvmsg;
         if (!cfg.no_hw_ts)
             get_ts(&msg_rx, &resp->hw_rx);
@@ -648,9 +777,11 @@ void reflect(config_t cfg) {
 
         /* Send pong — T3_SW from RDTSC */
         resp->sw_tx = rdtsc();
+        pmc_snapshot(pmc_pre_sendto);
         tsc_pre_sendto = rdtsc();
         sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
         tsc_sendto = rdtsc();
+        pmc_snapshot(pmc_post_sendto);
 
         if (!cfg.no_tx_ts) {
             /* Wait for TX timestamp (blocks until POLLPRI or signal) */
@@ -675,7 +806,7 @@ void reflect(config_t cfg) {
             /* No TX timestamp — use RDTSC delta as approximate response time */
             tsc_poll_tx = tsc_sendto;
             tsc_errqueue = tsc_sendto;
-            resp->delta = (uint64_t)((tsc_sendto - tsc_recvmsg) * 1000000000ULL / cycles_per_sec);
+            resp->delta = (uint64_t)((tsc_sendto - tsc_pre_recvmsg) * 1000000000ULL / cycles_per_sec);
         }
 
         packet_count++;
@@ -716,6 +847,16 @@ void reflect(config_t cfg) {
             log_size++;
         }
 
+        /* Accumulate fast-path PMC stats (delta < 20us) for comparison */
+        if (pmc_count > 0 && resp->delta < 20000) {
+            for (int i = 0; i < pmc_count; i++) {
+                pmc_fast_poll_sum[i] += pmc_post_poll[i] - pmc_pre_poll[i];
+                pmc_fast_recvmsg_sum[i] += pmc_post_recvmsg[i] - pmc_pre_recvmsg[i];
+                pmc_fast_sendto_sum[i] += pmc_post_sendto[i] - pmc_pre_sendto[i];
+            }
+            pmc_fast_count++;
+        }
+
         if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
             printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
                    resp->delta, cfg.threshold);
@@ -748,6 +889,37 @@ void reflect(config_t cfg) {
             }
             printf("    total:              %"PRIu64" ns\n",
                    (uint64_t)((tsc_errqueue - tsc_before_poll) * 1000000000ULL / cycles_per_sec));
+
+            if (pmc_count > 0) {
+                printf("  --- PMC: this spike ---\n");
+                printf("    poll() syscall:\n");
+                for (int i = 0; i < pmc_count; i++)
+                    printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
+                           pmc_post_poll[i] - pmc_pre_poll[i]);
+                printf("    recvmsg() syscall:\n");
+                for (int i = 0; i < pmc_count; i++)
+                    printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
+                           pmc_post_recvmsg[i] - pmc_pre_recvmsg[i]);
+                printf("    sendto() syscall:\n");
+                for (int i = 0; i < pmc_count; i++)
+                    printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
+                           pmc_post_sendto[i] - pmc_pre_sendto[i]);
+                if (pmc_fast_count > 0) {
+                    printf("  --- PMC: fast-path avg (<20us, %"PRIu64" samples) ---\n", pmc_fast_count);
+                    printf("    poll() syscall:\n");
+                    for (int i = 0; i < pmc_count; i++)
+                        printf("      %-20s: %.1f\n", pmc_counters[i].name,
+                               (double)pmc_fast_poll_sum[i] / pmc_fast_count);
+                    printf("    recvmsg() syscall:\n");
+                    for (int i = 0; i < pmc_count; i++)
+                        printf("      %-20s: %.1f\n", pmc_counters[i].name,
+                               (double)pmc_fast_recvmsg_sum[i] / pmc_fast_count);
+                    printf("    sendto() syscall:\n");
+                    for (int i = 0; i < pmc_count; i++)
+                        printf("      %-20s: %.1f\n", pmc_counters[i].name,
+                               (double)pmc_fast_sendto_sum[i] / pmc_fast_count);
+                }
+            }
 
             if (trace_marker_fd >= 0) {
                 char trace_msg[256];
@@ -873,6 +1045,7 @@ void print_usage(const char *progname) {
     printf("  -B, --budget <budget>         Set SO_BUSY_POLL_BUDGET (NAPI poll budget)\n");
     printf("  -P, --prefer-busypoll         Set SO_PREFER_BUSY_POLL (prefer busy poll over interrupt)\n");
     printf("  -v, --verbose                 Verbose output (show config, allocation, progress)\n");
+    printf("  -M, --pmc                     Enable hardware performance counter (rdpmc) instrumentation\n");
     printf("  -N, --no-tx-ts                Skip TX timestamp retrieval (server only, reduces latency)\n");
     printf("  -R, --no-hw-ts                Disable all HW timestamps, use RDTSC only for T1/T2/T3/T4\n");
     printf("  -h, --help                    Show this help message\n");
@@ -897,7 +1070,8 @@ int main(int argc, char **argv) {
 	.use_hugepages = 0,
 	.enable_trace_marker = 0,
 	.enable_snapshot = 0,
-	.verbose = 0
+	.verbose = 0,
+	.enable_pmc = 0
     };
     
     bucket_max = DEFAULT_BUCKET_MAX;
@@ -920,6 +1094,7 @@ int main(int argc, char **argv) {
         {"budget",           required_argument, 0, 'B'},
         {"prefer-busypoll",  no_argument,       0, 'P'},
         {"verbose",          no_argument,       0, 'v'},
+        {"pmc",              no_argument,       0, 'M'},
         {"log-threshold",    required_argument, 0, 'L'},
         {"continue",         no_argument,       0, 'C'},
         {"no-tx-ts",         no_argument,       0, 'N'},
@@ -930,7 +1105,7 @@ int main(int argc, char **argv) {
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSHl:GB:PvL:CNp:Rh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSHl:GB:PvML:CNp:Rh", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -1017,6 +1192,9 @@ int main(int argc, char **argv) {
 	    case 'v':  // --verbose
 		config.verbose = 1;
 		break;
+	    case 'M':  // --pmc
+		config.enable_pmc = 1;
+		break;
 	    case 'L':  // --log-threshold
 		;
 		uint64_t log_thresh_us = atoll(optarg);
@@ -1090,6 +1268,7 @@ int main(int argc, char **argv) {
         if (config.busy_poll_budget > 0)
             fprintf(stderr, "  Busy poll:      budget=%d, prefer=%s\n",
                 config.busy_poll_budget, config.prefer_busy_poll ? "yes" : "no");
+        fprintf(stderr, "  PMC (rdpmc):    %s\n", config.enable_pmc ? "yes" : "no");
         fprintf(stderr, "\n");
     }
 
@@ -1297,6 +1476,10 @@ int main(int argc, char **argv) {
     show_stats();
     if (config.show_histogram)
 	histogram_summary(config);
+
+    /* Cleanup PMC counters */
+    if (config.enable_pmc)
+        pmc_cleanup();
 
     /* Cleanup: munmap for hugepage allocations, free for regular allocations */
     if (log_book != NULL) {
