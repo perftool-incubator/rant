@@ -23,7 +23,7 @@
 #   --ptp-sync-to <dev>      PTP device to sync to (for second port)
 #   --no-namespace           Skip namespace setup (interface already configured)
 #   --no-ptp                 Skip PTP sync setup
-#   --irq-prio <n>           IRQ thread FIFO priority (default: 55)
+#   --irq-prio <n>           IRQ thread FIFO priority (default: 50)
 #   --ksoftirqd-prio <n>     ksoftirqd FIFO priority (default: 11)
 #   -h, --help               Show this help
 #
@@ -47,12 +47,12 @@ remote_ip=""
 remote_mac=""
 cpu=""
 irq_cpu=""
-busy_poll=0
+busy_poll=60
 ptp_source=""
 ptp_sync_to=""
 skip_namespace=0
 skip_ptp=0
-irq_prio=90
+irq_prio=50
 ksoftirqd_prio=11
 
 while [[ $# -gt 0 ]]; do
@@ -135,6 +135,21 @@ echo "  IRQ CPU:    $irq_cpu"
 echo ""
 set -x
 
+# --- SELinux AVC cache fix ---
+# Default AVC cache (512 entries) causes ~200-300us spikes when full.
+# 8192 entries eliminates eviction-driven policy recomputation.
+# See docs/selinux.md for details.
+if [[ -f /sys/fs/selinux/avc/cache_threshold ]]; then
+    current_avc=$(cat /sys/fs/selinux/avc/cache_threshold)
+    if [[ "$current_avc" -lt 8192 ]]; then
+        echo 8192 > /sys/fs/selinux/avc/cache_threshold
+        { set +x; } 2>/dev/null
+        echo "=== SELinux AVC cache fix ==="
+        echo "  cache_threshold: $current_avc -> 8192"
+        set -x
+    fi
+fi
+
 # --- Sysctl tuning ---
 sysctl -w net.core.busy_poll=$busy_poll
 sysctl -w net.core.busy_read=$busy_poll
@@ -178,7 +193,8 @@ $ns_cmd ethtool -K "$ifname" lro off gro off
 $ns_cmd ethtool -K "$ifname" tso off gso off
 $ns_cmd ethtool -C "$ifname" rx-frames 1 tx-frames 1
 $ns_cmd ethtool -C "$ifname" adaptive-tx off adaptive-rx off rx-usecs 0 tx-usecs 0
-$ns_cmd ethtool -G "$ifname" rx 512 tx 512
+$ns_cmd ethtool -G "$ifname" rx 128 tx 128
+$ns_cmd ethtool -g "$ifname"
 $ns_cmd ethtool -A "$ifname" rx off tx off
 
 # Driver-specific private flags
@@ -210,18 +226,20 @@ $ns_cmd ip addr add "${ip_addr}/24" dev "$ifname" 2>/dev/null || true
 # Qdisc
 $ns_cmd tc qdisc replace dev "$ifname" root noqueue
 
-# Static ARP and traffic reduction
-$ns_cmd ip neigh flush all
-if [[ -n "$remote_mac" ]]; then
-    $ns_cmd ip neigh replace "$remote_ip" lladdr "$remote_mac" dev "$ifname"
-fi
-$ns_cmd ip neigh show all
+# Traffic reduction
 $ns_cmd ip link set "$ifname" promisc on
 $ns_cmd sysctl -w "net.ipv6.conf.$ifname.disable_ipv6=1"
 $ns_cmd ip link set "$ifname" multicast off
-$ns_cmd ip link set "$ifname" arp off
 $ns_cmd sysctl -w net.ipv4.conf.all.arp_ignore=1
 $ns_cmd sysctl -w net.ipv4.conf.all.arp_announce=2
+
+# Static ARP — do NOT use "ip link set arp off", it flushes all neighbour entries
+# including permanent ones. arp_ignore=1 + arp_announce=2 above suppress ARP traffic.
+$ns_cmd ip neigh flush all
+if [[ -n "$remote_mac" ]]; then
+    $ns_cmd ip neigh replace "$remote_ip" lladdr "$remote_mac" nud permanent dev "$ifname"
+fi
+$ns_cmd ip neigh show all
 
 # --- CPU isolation and IRQ affinity ---
 tuna isolate -c "$cpu,$irq_cpu"
@@ -246,7 +264,7 @@ else
 fi
 
 if [[ -n "$async_thread" ]]; then
-    # Set async0 (firmware events) to low priority — must not preempt comp0
+    # Set async0 (firmware events) priority
     taskset -p -c "$irq_cpu" "$async_thread"
     chrt -f -p "$ksoftirqd_prio" "$async_thread"
     { set +x; } 2>/dev/null
@@ -256,17 +274,30 @@ if [[ -n "$async_thread" ]]; then
     set -x
 fi
 
-# Move all other IRQ threads off the app and IRQ CPUs
+# Evict or demote other IRQ threads on app and IRQ CPUs.
+# Managed IRQs (NVMe, mpi3mr, etc.) cannot be moved via taskset or smp_affinity —
+# the kernel enforces their CPU affinity. Instead, we lower them to SCHED_OTHER
+# so they cannot preempt the latency-sensitive workload.
 { set +x; } 2>/dev/null
 echo ""
-echo "=== Moving other IRQ threads off CPUs $cpu and $irq_cpu ==="
+echo "=== Evicting/demoting IRQ threads on CPUs $cpu and $irq_cpu ==="
 for target_cpu in $cpu $irq_cpu; do
     for pid in $(ps -eLo pid,psr,comm | awk -v cpu="$target_cpu" '$2==cpu && $3~/^irq\// {print $1}'); do
         comm=$(cat /proc/$pid/comm 2>/dev/null)
         # Skip our mlx5 comp0 and async0 threads
         if [[ "$pid" != "$comp_thread" && "$pid" != "$async_thread" ]]; then
-            taskset -p -c 0 "$pid" 2>/dev/null && \
-                echo "  Moved $comm (PID $pid) off CPU $target_cpu"
+            # Try to move off the CPU first
+            if taskset -p -c 0 "$pid" 2>/dev/null; then
+                # Verify it actually moved (managed IRQs report success but stay put)
+                new_cpu=$(ps -o psr= -p "$pid" 2>/dev/null | tr -d ' ')
+                if [[ "$new_cpu" == "$target_cpu" ]]; then
+                    # Managed IRQ: can't move, demote to SCHED_OTHER instead
+                    chrt -o -p 0 "$pid" 2>/dev/null && \
+                        echo "  Demoted $comm (PID $pid) to SCHED_OTHER on CPU $target_cpu (managed IRQ)"
+                else
+                    echo "  Moved $comm (PID $pid) from CPU $target_cpu to CPU $new_cpu"
+                fi
+            fi
         fi
     done
 done
