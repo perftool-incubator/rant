@@ -391,9 +391,7 @@ setpci -s "$pci" 0xd0.b=0x00
 
 # --- PTP clock setup ---
 if [[ "$skip_ptp" -eq 0 && -n "$ptp_source" ]]; then
-    # Kill ALL phc2sys instances — continuous PHC adjustment during the test
-    # causes backward clock jumps (negative deltas). Each side of rant only
-    # compares timestamps from its OWN PHC, so drift from wall clock is irrelevant.
+    # Kill ALL phc2sys instances (will restart with clock sync below)
     pkill -f "phc2sys" 2>/dev/null || true
     sleep 0.5
 
@@ -404,9 +402,23 @@ if [[ "$skip_ptp" -eq 0 && -n "$ptp_source" ]]; then
     echo ""
     echo "=== PTP clock ==="
     echo "  PHC device: $ptp_source"
-    echo "  Mode:       step-corrected to system time, then free-running"
-    echo "  Note:       phc2sys killed — PHC will drift ~1ppm from wall clock"
-    echo "              This does NOT affect latency measurements (same-clock deltas)"
+
+    # Start phc2sys to synchronize clocks for SW/HW timestamp comparison
+    # This enables breaking down server kernel RX vs TX latency
+    if [[ -z "$ptp_sync_to" ]]; then
+        # First port: sync system CLOCK_REALTIME (and thus CLOCK_TAI) to this PHC
+        echo "  Mode:       phc2sys syncing system clock to $ptp_source"
+        phc2sys -s "$ptp_source" -O 0 -S 0.0 -P 1.0 -I 0.1 -R 16 -l 6 >/dev/null 2>&1 &
+        sleep 2
+        echo "  phc2sys pid: $(pgrep -f "phc2sys.*$ptp_source.*-R")"
+    else
+        # Second port: sync this PHC to the first port's PHC
+        echo "  Mode:       phc2sys syncing $ptp_source to $ptp_sync_to"
+        phc2sys -s "$ptp_sync_to" -c "$ptp_source" -O 0 -S 0.0 -l 6 >/dev/null 2>&1 &
+        sleep 2
+        echo "  phc2sys pid: $(pgrep -f "phc2sys.*$ptp_sync_to.*-c")"
+    fi
+    echo "  Note:       SW timestamps (RDTSC→TAI) now align with HW timestamps (PHC)"
     echo ""
     set -x
 fi

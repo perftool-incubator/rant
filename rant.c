@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,8 @@
 #include <sys/stat.h>
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
+#include <pthread.h>
+#include <sched.h>
 
 #ifndef SO_PREFER_BUSY_POLL
 #define SO_PREFER_BUSY_POLL 69
@@ -55,6 +58,8 @@ typedef struct {
     int enable_pmc;
     int no_tx_ts;
     int no_hw_ts;
+    int fast_path;
+    int threaded;
 } config_t;
 
 uint64_t *histogram = NULL;
@@ -462,21 +467,22 @@ void emit(config_t cfg) {
     inet_pton(AF_INET, cfg.ip, &addr.sin_addr);
 
     /* RX */
-    char buf_rx[1];
+    /* Single buffer for both RX and TX - better cache locality */
+    char buf[1];
     char cbuf_rx[256];
+    char cbuf_tx[256];
     struct pollfd pfd_rx = { .fd = s, .events = POLLIN };
+    struct pollfd pfd_tx = { .fd = s, .events = POLLPRI };
+
     struct iovec iov_rx;
-    iov_rx.iov_base = buf_rx; iov_rx.iov_len = sizeof(buf_rx);
+    iov_rx.iov_base = buf; iov_rx.iov_len = sizeof(buf);
     struct msghdr msg_rx = {0};
     msg_rx.msg_iov = &iov_rx; msg_rx.msg_iovlen = 1;
     msg_rx.msg_control = cbuf_rx;
 
-    /* TX */
-    char buf_tx[1];
-    char cbuf_tx[256];
-    struct pollfd pfd_tx = { .fd = s, .events = POLLPRI };
+    /* TX uses same buffer - true packet reflection */
     struct iovec iov_tx;
-    iov_tx.iov_base = buf_tx; iov_tx.iov_len = sizeof(buf_tx);
+    iov_tx.iov_base = buf; iov_tx.iov_len = sizeof(buf);
     struct msghdr msg_tx = {0};
     msg_tx.msg_iov = &iov_tx; msg_tx.msg_iovlen = 1;
     msg_tx.msg_control = cbuf_tx;
@@ -528,7 +534,7 @@ void emit(config_t cfg) {
         tsc_pre_sendto = rtt->sw_tx;
 
         /* Send Ping */
-        sendto(s, buf_tx, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
+        sendto(s, buf, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
         tsc_sendto = rdtsc();
 
         if (!cfg.no_hw_ts) {
@@ -652,7 +658,7 @@ void reflect(config_t cfg) {
 
     /* Socket options including Hardware Timestamping */
     int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (!cfg.no_hw_ts) {
+    if (!cfg.no_hw_ts && !cfg.fast_path) {
         struct ifreq ifr; strncpy(ifr.ifr_name, cfg.iface, IFNAMSIZ);
         struct hwtstamp_config hw_cfg = {
             .tx_type = cfg.no_tx_ts ? HWTSTAMP_TX_OFF : HWTSTAMP_TX_ON,
@@ -690,23 +696,24 @@ void reflect(config_t cfg) {
     /* RX */
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
-    char buf_rx[1];
+    /* Single buffer for both RX and TX - better cache locality */
+    char buf[1];
     char cbuf_rx[256];
+    char cbuf_tx[256];
     struct pollfd pfd_rx = { .fd = s, .events = POLLIN };
+    struct pollfd pfd_tx = { .fd = s, .events = POLLPRI };
+
     struct iovec iov_rx;
-    iov_rx.iov_base = buf_rx; iov_rx.iov_len = sizeof(buf_rx);
+    iov_rx.iov_base = buf; iov_rx.iov_len = sizeof(buf);
     struct msghdr msg_rx = {0};
     msg_rx.msg_name = &client_addr;
     msg_rx.msg_namelen = client_len;
     msg_rx.msg_iov = &iov_rx; msg_rx.msg_iovlen = 1;
     msg_rx.msg_control = cbuf_rx;
 
-    /* TX */
-    char buf_tx[1];
-    char cbuf_tx[256];
-    struct pollfd pfd_tx = { .fd = s, .events = POLLPRI };
+    /* TX uses same buffer - true packet reflection */
     struct iovec iov_tx;
-    iov_tx.iov_base = buf_tx; iov_tx.iov_len = sizeof(buf_tx);
+    iov_tx.iov_base = buf; iov_tx.iov_len = sizeof(buf);
     struct msghdr msg_tx = {0};
     msg_tx.msg_iov = &iov_tx; msg_tx.msg_iovlen = 1;
     msg_tx.msg_control = cbuf_tx;
@@ -725,6 +732,9 @@ void reflect(config_t cfg) {
         else
             fprintf(stderr, "Warning: No PMC counters available. Continuing without PMC.\n");
     }
+
+    if (cfg.fast_path)
+        fprintf(stderr, "Fast path: connect()+send(), tight loop, no HW timestamps, prefetch\n");
 
     uint64_t start_tsc = rdtsc();
     uint64_t test_start_tsc = start_tsc;
@@ -749,6 +759,8 @@ void reflect(config_t cfg) {
     uint64_t pmc_fast_poll_sum[PMC_MAX] = {0}, pmc_fast_recvmsg_sum[PMC_MAX] = {0}, pmc_fast_sendto_sum[PMC_MAX] = {0};
     uint64_t pmc_fast_count = 0;
 
+    int connected = 0;  /* For fast_path: connected socket after first packet */
+
     while (keep_running) {
 
         /* Use warmup_record as scratch; log_book write is deferred until after delta is known */
@@ -757,56 +769,91 @@ void reflect(config_t cfg) {
         /* Wait for ping (busy-polls via SO_BUSY_POLL, then dequeue) */
         msg_rx.msg_controllen = sizeof(cbuf_rx);
         msg_rx.msg_flags = 0;
-        pmc_snapshot(pmc_pre_poll);
-        tsc_before_poll = rdtsc();
-        poll(&pfd_rx, 1, -1);
-        if (!keep_running) break;
-        tsc_poll = rdtsc();
-        pmc_snapshot(pmc_post_poll);
 
-        /* Receive ping — T2_HW from cmsg, T2_SW from RDTSC */
-        pmc_snapshot(pmc_pre_recvmsg);
-        tsc_pre_recvmsg = rdtsc();
-        recvmsg(s, &msg_rx, 0);
-        tsc_recvmsg = rdtsc();
-        pmc_snapshot(pmc_post_recvmsg);
-        resp->sw_rx = tsc_recvmsg;
-        if (!cfg.no_hw_ts)
-            get_ts(&msg_rx, &resp->hw_rx);
-        tsc_get_ts = rdtsc();
-
-        /* Send pong — T3_SW from RDTSC */
-        resp->sw_tx = rdtsc();
-        pmc_snapshot(pmc_pre_sendto);
-        tsc_pre_sendto = rdtsc();
-        sendto(s, buf_tx, 1, 0, (struct sockaddr *)&client_addr, client_len);
-        tsc_sendto = rdtsc();
-        pmc_snapshot(pmc_post_sendto);
-
-        if (!cfg.no_tx_ts) {
-            /* Wait for TX timestamp (blocks until POLLPRI or signal) */
-            msg_tx.msg_controllen = sizeof(cbuf_tx);
-            msg_tx.msg_flags = 0;
-            poll(&pfd_tx, 1, -1);
+        if (cfg.fast_path) {
+            /* Fast path: minimize work between recvmsg and send */
+            if (pmc_count > 0) pmc_snapshot(pmc_pre_poll);
+            tsc_before_poll = rdtsc();
+            poll(&pfd_rx, 1, -1);
             if (!keep_running) break;
-            tsc_poll_tx = rdtsc();
 
-            /* Retrieve T3_HW from error queue */
-            recvmsg(s, &msg_tx, MSG_ERRQUEUE);
-            tsc_errqueue = rdtsc();
-            get_ts(&msg_tx, &resp->hw_tx);
+            /* Tight: recvmsg → send, nothing else. Same buffer = cache hit! */
+            tsc_pre_recvmsg = rdtsc();
+            recvmsg(s, &msg_rx, 0);
+            __builtin_prefetch(buf, 0, 3);  /* Now truly useful - buf just loaded by recvmsg */
+            if (connected)
+                send(s, buf, 1, 0);
+            else {
+                sendto(s, buf, 1, 0, (struct sockaddr *)&client_addr, client_len);
+                connect(s, (struct sockaddr *)&client_addr, client_len);
+                connected = 1;
+            }
+            tsc_sendto = rdtsc();
+            if (pmc_count > 0) pmc_snapshot(pmc_post_sendto);
 
-            /* Calculate response latency: T3_HW - T2_HW */
-            int64_t signed_delta =
-                (resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
-                (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
-            if (signed_delta < 0) { negative_delta_count++; signed_delta = 0; }
-            resp->delta = (uint64_t)signed_delta;
-        } else {
-            /* No TX timestamp — use RDTSC delta as approximate response time */
+            /* Deferred bookkeeping — all after send */
+            tsc_recvmsg = tsc_pre_recvmsg;
+            resp->sw_rx = tsc_pre_recvmsg;
+            resp->sw_tx = tsc_sendto;
+            tsc_poll = tsc_pre_recvmsg;
+            tsc_get_ts = tsc_pre_recvmsg;
+            tsc_pre_sendto = tsc_pre_recvmsg;
             tsc_poll_tx = tsc_sendto;
             tsc_errqueue = tsc_sendto;
             resp->delta = (uint64_t)((tsc_sendto - tsc_pre_recvmsg) * 1000000000ULL / cycles_per_sec);
+        } else {
+            /* Normal path: full per-syscall instrumentation */
+            pmc_snapshot(pmc_pre_poll);
+            tsc_before_poll = rdtsc();
+            poll(&pfd_rx, 1, -1);
+            if (!keep_running) break;
+            tsc_poll = rdtsc();
+            pmc_snapshot(pmc_post_poll);
+
+            /* Receive ping — T2_HW from cmsg, T2_SW from RDTSC */
+            pmc_snapshot(pmc_pre_recvmsg);
+            tsc_pre_recvmsg = rdtsc();
+            recvmsg(s, &msg_rx, 0);
+            tsc_recvmsg = rdtsc();
+            pmc_snapshot(pmc_post_recvmsg);
+            resp->sw_rx = tsc_poll;  /* T2_SW = after poll (packet ready) */
+            if (!cfg.no_hw_ts)
+                get_ts(&msg_rx, &resp->hw_rx);
+            tsc_get_ts = rdtsc();
+
+            /* Send pong — T3_SW from RDTSC */
+            pmc_snapshot(pmc_pre_sendto);
+            tsc_pre_sendto = rdtsc();
+            sendto(s, buf, 1, 0, (struct sockaddr *)&client_addr, client_len);
+            tsc_sendto = rdtsc();
+            resp->sw_tx = tsc_sendto;  /* T3_SW = after sendto (response queued) */
+            pmc_snapshot(pmc_post_sendto);
+
+            if (!cfg.no_tx_ts) {
+                /* Wait for TX timestamp (blocks until POLLPRI or signal) */
+                msg_tx.msg_controllen = sizeof(cbuf_tx);
+                msg_tx.msg_flags = 0;
+                poll(&pfd_tx, 1, -1);
+                if (!keep_running) break;
+                tsc_poll_tx = rdtsc();
+
+                /* Retrieve T3_HW from error queue */
+                recvmsg(s, &msg_tx, MSG_ERRQUEUE);
+                tsc_errqueue = rdtsc();
+                get_ts(&msg_tx, &resp->hw_tx);
+
+                /* Calculate response latency: T3_HW - T2_HW */
+                int64_t signed_delta =
+                    (resp->hw_tx.tv_sec - resp->hw_rx.tv_sec) * 1000000000LL +
+                    (resp->hw_tx.tv_nsec - resp->hw_rx.tv_nsec);
+                if (signed_delta < 0) { negative_delta_count++; signed_delta = 0; }
+                resp->delta = (uint64_t)signed_delta;
+            } else {
+                /* No TX timestamp — use RDTSC delta as approximate response time */
+                tsc_poll_tx = tsc_sendto;
+                tsc_errqueue = tsc_sendto;
+                resp->delta = (uint64_t)((tsc_sendto - tsc_pre_recvmsg) * 1000000000ULL / cycles_per_sec);
+            }
         }
 
         packet_count++;
@@ -849,10 +896,15 @@ void reflect(config_t cfg) {
 
         /* Accumulate fast-path PMC stats (delta < 20us) for comparison */
         if (pmc_count > 0 && resp->delta < 20000) {
-            for (int i = 0; i < pmc_count; i++) {
-                pmc_fast_poll_sum[i] += pmc_post_poll[i] - pmc_pre_poll[i];
-                pmc_fast_recvmsg_sum[i] += pmc_post_recvmsg[i] - pmc_pre_recvmsg[i];
-                pmc_fast_sendto_sum[i] += pmc_post_sendto[i] - pmc_pre_sendto[i];
+            if (cfg.fast_path) {
+                for (int i = 0; i < pmc_count; i++)
+                    pmc_fast_poll_sum[i] += pmc_post_sendto[i] - pmc_pre_poll[i];
+            } else {
+                for (int i = 0; i < pmc_count; i++) {
+                    pmc_fast_poll_sum[i] += pmc_post_poll[i] - pmc_pre_poll[i];
+                    pmc_fast_recvmsg_sum[i] += pmc_post_recvmsg[i] - pmc_pre_recvmsg[i];
+                    pmc_fast_sendto_sum[i] += pmc_post_sendto[i] - pmc_pre_sendto[i];
+                }
             }
             pmc_fast_count++;
         }
@@ -860,9 +912,11 @@ void reflect(config_t cfg) {
         if (cfg.threshold > 0 && resp->delta > cfg.threshold) {
             printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
                    resp->delta, cfg.threshold);
-            printf("  T2_HW (NIC rx):  %ld.%09ld\n", resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec);
-            if (!cfg.no_tx_ts)
-                printf("  T3_HW (NIC tx):  %ld.%09ld\n", resp->hw_tx.tv_sec, resp->hw_tx.tv_nsec);
+            if (!cfg.fast_path) {
+                printf("  T2_HW (NIC rx):  %ld.%09ld\n", resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec);
+                if (!cfg.no_tx_ts)
+                    printf("  T3_HW (NIC tx):  %ld.%09ld\n", resp->hw_tx.tv_sec, resp->hw_tx.tv_nsec);
+            }
             printf("  App processing (T3_SW - T2_SW): %"PRIu64" ns\n",
                    (uint64_t)((resp->sw_tx - resp->sw_rx) * 1000000000ULL / cycles_per_sec));
             printf("  --- RDTSC breakdown ---\n");
@@ -891,33 +945,46 @@ void reflect(config_t cfg) {
                    (uint64_t)((tsc_errqueue - tsc_before_poll) * 1000000000ULL / cycles_per_sec));
 
             if (pmc_count > 0) {
-                printf("  --- PMC: this spike ---\n");
-                printf("    poll() syscall:\n");
-                for (int i = 0; i < pmc_count; i++)
-                    printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
-                           pmc_post_poll[i] - pmc_pre_poll[i]);
-                printf("    recvmsg() syscall:\n");
-                for (int i = 0; i < pmc_count; i++)
-                    printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
-                           pmc_post_recvmsg[i] - pmc_pre_recvmsg[i]);
-                printf("    sendto() syscall:\n");
-                for (int i = 0; i < pmc_count; i++)
-                    printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
-                           pmc_post_sendto[i] - pmc_pre_sendto[i]);
-                if (pmc_fast_count > 0) {
-                    printf("  --- PMC: fast-path avg (<20us, %"PRIu64" samples) ---\n", pmc_fast_count);
+                if (cfg.fast_path) {
+                    printf("  --- PMC: this spike (total recv+send) ---\n");
+                    for (int i = 0; i < pmc_count; i++)
+                        printf("    %-20s: %"PRIu64"\n", pmc_counters[i].name,
+                               pmc_post_sendto[i] - pmc_pre_poll[i]);
+                    if (pmc_fast_count > 0) {
+                        printf("  --- PMC: fast-path avg (<20us, %"PRIu64" samples) ---\n", pmc_fast_count);
+                        for (int i = 0; i < pmc_count; i++)
+                            printf("    %-20s: %.1f\n", pmc_counters[i].name,
+                                   (double)pmc_fast_poll_sum[i] / pmc_fast_count);
+                    }
+                } else {
+                    printf("  --- PMC: this spike ---\n");
                     printf("    poll() syscall:\n");
                     for (int i = 0; i < pmc_count; i++)
-                        printf("      %-20s: %.1f\n", pmc_counters[i].name,
-                               (double)pmc_fast_poll_sum[i] / pmc_fast_count);
+                        printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
+                               pmc_post_poll[i] - pmc_pre_poll[i]);
                     printf("    recvmsg() syscall:\n");
                     for (int i = 0; i < pmc_count; i++)
-                        printf("      %-20s: %.1f\n", pmc_counters[i].name,
-                               (double)pmc_fast_recvmsg_sum[i] / pmc_fast_count);
+                        printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
+                               pmc_post_recvmsg[i] - pmc_pre_recvmsg[i]);
                     printf("    sendto() syscall:\n");
                     for (int i = 0; i < pmc_count; i++)
-                        printf("      %-20s: %.1f\n", pmc_counters[i].name,
-                               (double)pmc_fast_sendto_sum[i] / pmc_fast_count);
+                        printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
+                               pmc_post_sendto[i] - pmc_pre_sendto[i]);
+                    if (pmc_fast_count > 0) {
+                        printf("  --- PMC: fast-path avg (<20us, %"PRIu64" samples) ---\n", pmc_fast_count);
+                        printf("    poll() syscall:\n");
+                        for (int i = 0; i < pmc_count; i++)
+                            printf("      %-20s: %.1f\n", pmc_counters[i].name,
+                                   (double)pmc_fast_poll_sum[i] / pmc_fast_count);
+                        printf("    recvmsg() syscall:\n");
+                        for (int i = 0; i < pmc_count; i++)
+                            printf("      %-20s: %.1f\n", pmc_counters[i].name,
+                                   (double)pmc_fast_recvmsg_sum[i] / pmc_fast_count);
+                        printf("    sendto() syscall:\n");
+                        for (int i = 0; i < pmc_count; i++)
+                            printf("      %-20s: %.1f\n", pmc_counters[i].name,
+                                   (double)pmc_fast_sendto_sum[i] / pmc_fast_count);
+                    }
                 }
             }
 
@@ -1048,7 +1115,376 @@ void print_usage(const char *progname) {
     printf("  -M, --pmc                     Enable hardware performance counter (rdpmc) instrumentation\n");
     printf("  -N, --no-tx-ts                Skip TX timestamp retrieval (server only, reduces latency)\n");
     printf("  -R, --no-hw-ts                Disable all HW timestamps, use RDTSC only for T1/T2/T3/T4\n");
+    printf("  -F, --fast-path               Cache-warming optimizations (server: connect+send, tight loop, no RX ts, prefetch)\n");
+    printf("  -2, --threaded                Split send/receive into separate threads (needs 3 CPUs via taskset)\n");
     printf("  -h, --help                    Show this help message\n");
+}
+
+/* ================================================================
+ * Split send/receive threading architecture
+ * Receiver thread handles poll()+recvmsg(), sender thread handles send().
+ * Each pinned to its own CPU to avoid I-cache thrashing between
+ * the recvmsg and sendto kernel code paths.
+ * ================================================================ */
+
+struct split_ctx {
+    volatile int state __attribute__((aligned(64)));
+    char _pad[60];
+    int socket_fd;
+    config_t cfg;
+    int cpu_recv;
+    int cpu_send;
+    struct sockaddr_in peer_addr;
+    socklen_t peer_len;
+    uint64_t tsc_recvmsg;
+    uint64_t tsc_sendto;
+};
+
+static void pin_thread(int cpu) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    sched_setaffinity(0, sizeof(set), &set);
+}
+
+static int parse_thread_cpus(int *cpus, int max_cpus) {
+    cpu_set_t set;
+    sched_getaffinity(0, sizeof(set), &set);
+    int n = 0;
+    for (int i = 0; i < CPU_SETSIZE && n < max_cpus; i++)
+        if (CPU_ISSET(i, &set))
+            cpus[n++] = i;
+    return n;
+}
+
+/* --- Server receiver thread --- */
+static void *srv_recv_thread(void *arg) {
+    struct split_ctx *ctx = arg;
+    pin_thread(ctx->cpu_recv);
+
+    int s = ctx->socket_fd;
+    char buf[1], cbuf[256];
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    struct iovec iov = { .iov_base = buf, .iov_len = 1 };
+    struct msghdr msg = {
+        .msg_name = &client_addr, .msg_namelen = client_len,
+        .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = cbuf
+    };
+    struct pollfd pfd = { .fd = s, .events = POLLIN };
+
+    while (keep_running) {
+        msg.msg_controllen = sizeof(cbuf);
+        msg.msg_flags = 0;
+        if (poll(&pfd, 1, 100) <= 0) continue;
+        if (!keep_running) break;
+
+        recvmsg(s, &msg, 0);
+        ctx->tsc_recvmsg = rdtsc();
+        ctx->peer_addr = client_addr;
+        ctx->peer_len = client_len;
+        __atomic_store_n(&ctx->state, 1, __ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+
+/* --- Server sender thread --- */
+static void *srv_send_thread(void *arg) {
+    struct split_ctx *ctx = arg;
+    pin_thread(ctx->cpu_send);
+
+    int s = ctx->socket_fd;
+    char buf[1] = {0};  /* Single buffer for XDP thread too */
+    int connected = 0;
+    uint64_t packet_count = 0;
+    uint64_t test_start_tsc = rdtsc();
+    uint64_t deadline = 0;
+
+    while (keep_running) {
+        while (__atomic_load_n(&ctx->state, __ATOMIC_ACQUIRE) == 0) {
+            if (!keep_running) goto done;
+            __builtin_ia32_pause();
+        }
+
+        uint64_t tsc_recv_snap = ctx->tsc_recvmsg;  /* snapshot before releasing state */
+        __builtin_prefetch(buf, 0, 3);
+        if (connected)
+            send(s, buf, 1, 0);
+        else {
+            sendto(s, buf, 1, 0,
+                   (struct sockaddr *)&ctx->peer_addr, ctx->peer_len);
+            connect(s, (struct sockaddr *)&ctx->peer_addr, ctx->peer_len);
+            connected = 1;
+        }
+        uint64_t tsc_sendto = rdtsc();
+        __atomic_store_n(&ctx->state, 0, __ATOMIC_RELEASE);
+
+        packet_count++;
+        if (packet_count == ctx->cfg.warmup) {
+            test_start_tsc = rdtsc();
+            deadline = ctx->cfg.duration > 0 ?
+                test_start_tsc + ctx->cfg.duration * cycles_per_sec : 0;
+            if (ctx->cfg.warmup > 0)
+                fprintf(stderr, "Warmup complete (%"PRIu64" packets), test started\n",
+                        ctx->cfg.warmup);
+        }
+        if (packet_count <= ctx->cfg.warmup) continue;
+
+        uint64_t delta_ns = (uint64_t)(
+            (tsc_sendto - tsc_recv_snap) * 1000000000ULL / cycles_per_sec);
+
+        histogram_record(delta_ns, ctx->cfg);
+
+        if (log_book != NULL &&
+            (ctx->cfg.log_threshold == 0 || delta_ns > ctx->cfg.log_threshold)) {
+            if (log_size < log_capacity) {
+                log_book[log_size].sw_rx = tsc_recv_snap;
+                log_book[log_size].sw_tx = tsc_sendto;
+                log_book[log_size].delta = delta_ns;
+            }
+            log_size++;
+        }
+
+        if (ctx->cfg.threshold > 0 && delta_ns > ctx->cfg.threshold) {
+            printf("Response latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns). [threaded]\n",
+                   delta_ns, ctx->cfg.threshold);
+            printf("  recv->send: %"PRIu64" ns\n", delta_ns);
+            if (!ctx->cfg.threshold_continue) {
+                keep_running = 0;
+                break;
+            }
+        }
+
+        if (deadline > 0 && tsc_sendto > deadline) break;
+    }
+
+done:;
+    uint64_t duration_cycles = rdtsc() - test_start_tsc;
+    printf("Test is complete. Duration: %.2f s\n",
+           (double)duration_cycles / cycles_per_sec);
+    return NULL;
+}
+
+void threaded_reflect(config_t cfg) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (cfg.busy_poll_us > 0)
+        setsockopt(s, SOL_SOCKET, SO_BUSY_POLL,
+                   &cfg.busy_poll_us, sizeof(cfg.busy_poll_us));
+    if (cfg.busy_poll_budget > 0)
+        setsockopt(s, SOL_SOCKET, SO_BUSY_POLL_BUDGET,
+                   &cfg.busy_poll_budget, sizeof(cfg.busy_poll_budget));
+    if (cfg.prefer_busy_poll) {
+        int prefer = 1;
+        setsockopt(s, SOL_SOCKET, SO_PREFER_BUSY_POLL, &prefer, sizeof(prefer));
+    }
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET, .sin_port = htons(12345),
+        .sin_addr.s_addr = INADDR_ANY
+    };
+    bind(s, (struct sockaddr *)&addr, sizeof(addr));
+
+    calibrate_rdtsc();
+    fprintf(stderr, "RDTSC: %"PRIu64" cycles/sec\n", cycles_per_sec);
+
+    int cpus[3], ncpus = parse_thread_cpus(cpus, 3);
+    if (ncpus < 3) {
+        fprintf(stderr, "Error: --threaded needs 3 CPUs (got %d).\n"
+                "  Usage: taskset -c main,recv,send ./rant --threaded ...\n", ncpus);
+        close(s);
+        return;
+    }
+    fprintf(stderr, "Threaded server: main=CPU%d recv=CPU%d send=CPU%d\n",
+            cpus[0], cpus[1], cpus[2]);
+    fprintf(stderr, "Using RDTSC timestamps (no HW timestamps in threaded mode)\n");
+
+    pin_thread(cpus[0]);
+
+    struct split_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.socket_fd = s;
+    ctx.cfg = cfg;
+    ctx.cpu_recv = cpus[1];
+    ctx.cpu_send = cpus[2];
+
+    fprintf(stderr, "Waiting for first packet...\n");
+
+    pthread_t recv_tid, send_tid;
+    pthread_create(&recv_tid, NULL, srv_recv_thread, &ctx);
+    pthread_create(&send_tid, NULL, srv_send_thread, &ctx);
+
+    pthread_join(send_tid, NULL);
+    keep_running = 0;
+    pthread_join(recv_tid, NULL);
+
+    close(s);
+}
+
+/* --- Client sender thread --- */
+static void *cli_send_thread(void *arg) {
+    struct split_ctx *ctx = arg;
+    pin_thread(ctx->cpu_send);
+
+    int s = ctx->socket_fd;
+    char buf[1] = {0};  /* Single buffer for XDP thread too */
+    struct sockaddr_in server_addr = {
+        .sin_family = AF_INET, .sin_port = htons(12345)
+    };
+    inet_pton(AF_INET, ctx->cfg.ip, &server_addr.sin_addr);
+
+    while (keep_running) {
+        while (__atomic_load_n(&ctx->state, __ATOMIC_ACQUIRE) != 0) {
+            if (!keep_running) return NULL;
+            __builtin_ia32_pause();
+        }
+
+        ctx->tsc_sendto = rdtsc();
+        sendto(s, buf, 1, 0,
+               (struct sockaddr *)&server_addr, sizeof(server_addr));
+        __atomic_store_n(&ctx->state, 1, __ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+
+/* --- Client receiver thread --- */
+static void *cli_recv_thread(void *arg) {
+    struct split_ctx *ctx = arg;
+    pin_thread(ctx->cpu_recv);
+
+    int s = ctx->socket_fd;
+    char buf[1], cbuf[256];
+    struct iovec iov = { .iov_base = buf, .iov_len = 1 };
+    struct msghdr msg = {
+        .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = cbuf
+    };
+    struct pollfd pfd = { .fd = s, .events = POLLIN };
+
+    uint64_t packet_count = 0;
+    uint64_t test_start_tsc = rdtsc();
+    uint64_t deadline = 0;
+    int poll_timeouts = 0;
+
+    while (keep_running) {
+        while (__atomic_load_n(&ctx->state, __ATOMIC_ACQUIRE) != 1) {
+            if (!keep_running) goto done;
+            __builtin_ia32_pause();
+        }
+
+        msg.msg_controllen = sizeof(cbuf);
+        msg.msg_flags = 0;
+        if (poll(&pfd, 1, 100) <= 0) {
+            if (++poll_timeouts >= 10) {
+                fprintf(stderr, "WARNING: no reply after %d poll timeouts, resending\n",
+                        poll_timeouts);
+                __atomic_store_n(&ctx->state, 0, __ATOMIC_RELEASE);
+                poll_timeouts = 0;
+            }
+            continue;
+        }
+        poll_timeouts = 0;
+        if (!keep_running) break;
+
+        recvmsg(s, &msg, 0);
+        uint64_t tsc_recvmsg = rdtsc();
+        uint64_t tsc_send_snap = ctx->tsc_sendto;  /* snapshot before releasing state */
+
+        packet_count++;
+        if (packet_count == ctx->cfg.warmup) {
+            test_start_tsc = rdtsc();
+            deadline = ctx->cfg.duration > 0 ?
+                test_start_tsc + ctx->cfg.duration * cycles_per_sec : 0;
+            if (ctx->cfg.warmup > 0)
+                fprintf(stderr, "Warmup complete (%"PRIu64" packets), test started\n",
+                        ctx->cfg.warmup);
+        }
+
+        __atomic_store_n(&ctx->state, 0, __ATOMIC_RELEASE);
+
+        if (packet_count <= ctx->cfg.warmup) continue;
+
+        uint64_t delta_ns = (uint64_t)(
+            (tsc_recvmsg - tsc_send_snap) * 1000000000ULL / cycles_per_sec);
+
+        histogram_record(delta_ns, ctx->cfg);
+
+        if (log_book != NULL &&
+            (ctx->cfg.log_threshold == 0 || delta_ns > ctx->cfg.log_threshold)) {
+            if (log_size < log_capacity) {
+                log_book[log_size].sw_tx = tsc_send_snap;
+                log_book[log_size].sw_rx = tsc_recvmsg;
+                log_book[log_size].delta = delta_ns;
+            }
+            log_size++;
+        }
+
+        if (ctx->cfg.threshold > 0 && delta_ns > ctx->cfg.threshold) {
+            printf("Round-Trip latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns). [threaded]\n",
+                   delta_ns, ctx->cfg.threshold);
+            if (!ctx->cfg.threshold_continue) {
+                keep_running = 0;
+                break;
+            }
+        }
+
+        if (deadline > 0 && tsc_recvmsg > deadline) break;
+    }
+
+done:;
+    uint64_t duration_cycles = rdtsc() - test_start_tsc;
+    printf("Test is complete. Duration: %.2f s\n",
+           (double)duration_cycles / cycles_per_sec);
+    return NULL;
+}
+
+void threaded_emit(config_t cfg) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (cfg.busy_poll_us > 0)
+        setsockopt(s, SOL_SOCKET, SO_BUSY_POLL,
+                   &cfg.busy_poll_us, sizeof(cfg.busy_poll_us));
+    if (cfg.busy_poll_budget > 0)
+        setsockopt(s, SOL_SOCKET, SO_BUSY_POLL_BUDGET,
+                   &cfg.busy_poll_budget, sizeof(cfg.busy_poll_budget));
+    if (cfg.prefer_busy_poll) {
+        int prefer = 1;
+        setsockopt(s, SOL_SOCKET, SO_PREFER_BUSY_POLL, &prefer, sizeof(prefer));
+    }
+
+    calibrate_rdtsc();
+    fprintf(stderr, "RDTSC: %"PRIu64" cycles/sec\n", cycles_per_sec);
+
+    int cpus[3], ncpus = parse_thread_cpus(cpus, 3);
+    if (ncpus < 3) {
+        fprintf(stderr, "Error: --threaded needs 3 CPUs (got %d).\n"
+                "  Usage: taskset -c main,send,recv ./rant --threaded ...\n", ncpus);
+        close(s);
+        return;
+    }
+    fprintf(stderr, "Threaded client: main=CPU%d send=CPU%d recv=CPU%d\n",
+            cpus[0], cpus[1], cpus[2]);
+    fprintf(stderr, "Using RDTSC timestamps (no HW timestamps in threaded mode)\n");
+
+    pin_thread(cpus[0]);
+
+    struct split_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.socket_fd = s;
+    ctx.cfg = cfg;
+    ctx.cpu_send = cpus[1];
+    ctx.cpu_recv = cpus[2];
+
+    pthread_t send_tid, recv_tid;
+    pthread_create(&send_tid, NULL, cli_send_thread, &ctx);
+    pthread_create(&recv_tid, NULL, cli_recv_thread, &ctx);
+
+    pthread_join(recv_tid, NULL);
+    keep_running = 0;
+    pthread_join(send_tid, NULL);
+
+    close(s);
 }
 
 int main(int argc, char **argv) {
@@ -1071,12 +1507,15 @@ int main(int argc, char **argv) {
 	.enable_trace_marker = 0,
 	.enable_snapshot = 0,
 	.verbose = 0,
-	.enable_pmc = 0
+	.enable_pmc = 0,
+	.fast_path = 0,
+	.threaded = 0
     };
     
     bucket_max = DEFAULT_BUCKET_MAX;
 
     signal(SIGINT, handle_sig);
+    signal(SIGTERM, handle_sig);
 
     static struct option long_options[] = {
         {"duration",         required_argument, 0, 'd'},
@@ -1099,13 +1538,15 @@ int main(int argc, char **argv) {
         {"continue",         no_argument,       0, 'C'},
         {"no-tx-ts",         no_argument,       0, 'N'},
         {"no-hw-ts",         no_argument,       0, 'R'},
+        {"fast-path",        no_argument,       0, 'F'},
+        {"threaded",         no_argument,       0, '2'},
         {"busy-poll-us",     required_argument, 0, 'p'},
         {"help",             no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSHl:GB:PvML:CNp:Rh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSHl:GB:PvML:CNp:RF2h", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -1213,6 +1654,13 @@ int main(int argc, char **argv) {
 	    case 'R':  // --no-hw-ts
 		config.no_hw_ts = 1;
 		config.no_tx_ts = 1;  /* implies no TX timestamps too */
+		break;
+	    case 'F':  // --fast-path
+		config.fast_path = 1;
+		config.no_tx_ts = 1;  /* fast path implies no TX timestamps */
+		break;
+	    case '2':  // --threaded
+		config.threaded = 1;
 		break;
 	    case 'p':  // --busy-poll-us
 		config.busy_poll_us = atoi(optarg);
@@ -1453,7 +1901,10 @@ int main(int argc, char **argv) {
 
     /* Reflect (server) */
     if (config.ip == NULL) {
-        reflect(config);
+        if (config.threaded)
+            threaded_reflect(config);
+        else
+            reflect(config);
 	if (config.log_file) {
 	    if (verbose)
 	        fprintf(stderr, "\n💾 Writing log to %s (%zu records)...\n", config.log_file, log_size);
@@ -1464,7 +1915,10 @@ int main(int argc, char **argv) {
     }
     /* Emit (client) */
     else {
-        emit(config);
+        if (config.threaded)
+            threaded_emit(config);
+        else
+            emit(config);
 	if (config.log_file) {
 	    if (verbose)
 	        fprintf(stderr, "\n💾 Writing log to %s (%zu records)...\n", config.log_file, log_size);
