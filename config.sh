@@ -206,6 +206,10 @@ case "$driver" in
         $ns_cmd ethtool --set-priv-flags "$ifname" rx_cqe_moder off
         $ns_cmd ethtool --set-priv-flags "$ifname" tx_port_ts off
         $ns_cmd ethtool --set-priv-flags "$ifname" skb_tx_mpwqe off
+        # Disable striding RQ (multi-packet WQE) for lower latency variance
+        # Tested 2026-06-01: rx_striding_rq=off improves p99.99 from 18→15us, MAX from 28→25us
+        # Throughput cost: ~1.7% (minimal). See results/5way_comparison_20260601_122528/
+        $ns_cmd ethtool --set-priv-flags "$ifname" rx_striding_rq off
         ;;
     ice)
         $ns_cmd ethtool --set-priv-flags "$ifname" LinkPolling off 2>/dev/null || true
@@ -226,15 +230,40 @@ $ns_cmd ip addr add "${ip_addr}/24" dev "$ifname" 2>/dev/null || true
 # Qdisc
 $ns_cmd tc qdisc replace dev "$ifname" root noqueue
 
-# Traffic reduction
+# Traffic reduction - eliminate ALL background protocols
+# Tested 2026-05-29: STP/LLDP/ARP/IPv6/multicast elimination confirmed
+# See results/test_60s_no_background_*/ANALYSIS.md
+
+# Promiscuous mode (required for AF_PACKET raw sockets)
 $ns_cmd ip link set "$ifname" promisc on
+
+# IPv6: disable completely and flush all addresses (removes link-local + multicast groups)
 $ns_cmd sysctl -w "net.ipv6.conf.$ifname.disable_ipv6=1"
+$ns_cmd ip -6 addr flush dev "$ifname" 2>/dev/null || true
+
+# Multicast: disable at link layer
 $ns_cmd ip link set "$ifname" multicast off
+
+# ARP: suppress via sysctl (don't use "ip link set arp off" - it flushes permanent neighbors)
 $ns_cmd sysctl -w net.ipv4.conf.all.arp_ignore=1
 $ns_cmd sysctl -w net.ipv4.conf.all.arp_announce=2
 
-# Static ARP — do NOT use "ip link set arp off", it flushes all neighbour entries
-# including permanent ones. arp_ignore=1 + arp_announce=2 above suppress ARP traffic.
+# ICMP: disable redirects (both send and receive)
+$ns_cmd sysctl -w "net.ipv4.conf.$ifname.accept_redirects=0"
+$ns_cmd sysctl -w "net.ipv4.conf.$ifname.send_redirects=0"
+$ns_cmd sysctl -w "net.ipv6.conf.$ifname.accept_redirects=0" 2>/dev/null || true
+
+# Source routing: disable
+$ns_cmd sysctl -w "net.ipv4.conf.$ifname.accept_source_route=0"
+$ns_cmd sysctl -w "net.ipv6.conf.$ifname.accept_source_route=0" 2>/dev/null || true
+
+# Router advertisements: disable
+$ns_cmd sysctl -w "net.ipv6.conf.$ifname.accept_ra=0" 2>/dev/null || true
+
+# Reverse path filtering: disable (could cause drops on non-standard routing)
+$ns_cmd sysctl -w "net.ipv4.conf.$ifname.rp_filter=0"
+
+# Static ARP neighbor entries
 $ns_cmd ip neigh flush all
 if [[ -n "$remote_mac" ]]; then
     $ns_cmd ip neigh replace "$remote_ip" lladdr "$remote_mac" nud permanent dev "$ifname"

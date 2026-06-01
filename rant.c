@@ -152,7 +152,7 @@ static inline uint64_t rdtsc_to_tai_ns(uint64_t tsc) {
 
 /* --- Hardware Performance Counter (PMC) support via rdpmc --- */
 
-#define PMC_MAX 3
+#define PMC_MAX 5
 
 struct pmc_counter {
     const char *name;
@@ -173,6 +173,8 @@ static struct {
     { "L1d_miss",        0x000008d1 },  /* MEM_LOAD_RETIRED.L1_MISS */
     { "icache_stl",      0x00000480 },  /* ICACHE_DATA.STALLS */
     { "cycles",          0x0000003c },  /* CPU_CLK_UNHALTED.THREAD */
+    { "dtlb_load_miss",  0x000e12 },    /* dtlb_load_misses.walk_completed */
+    { "dtlb_store_miss", 0x000e13 },    /* dtlb_store_misses.walk_completed */
 };
 
 static long sys_perf_event_open(struct perf_event_attr *attr, pid_t pid,
@@ -230,6 +232,14 @@ static int pmc_setup(void) {
     return pmc_count;
 }
 
+/* Reset and enable PMC counters (call before starting measurement) */
+static void pmc_reset_and_enable(void) {
+    for (int i = 0; i < pmc_count; i++) {
+        ioctl(pmc_counters[i].fd, PERF_EVENT_IOC_RESET, 0);
+        ioctl(pmc_counters[i].fd, PERF_EVENT_IOC_ENABLE, 0);
+    }
+}
+
 static void pmc_cleanup(void) {
     for (int i = 0; i < pmc_count; i++) {
         if (pmc_counters[i].page)
@@ -242,15 +252,49 @@ static void pmc_cleanup(void) {
 
 /* Read a single PMC — one rdpmc instruction, ~20ns */
 static inline uint64_t read_pmc(int idx) {
-    uint32_t lo, hi;
-    __asm__ __volatile__("rdpmc" : "=a"(lo), "=d"(hi) : "c"(pmc_counters[idx].index));
-    return ((uint64_t)hi << 32) | lo;
+    uint32_t lo, hi, seq;
+    uint64_t count;
+    struct perf_event_mmap_page *pc = pmc_counters[idx].page;
+
+    /* Seqlock read loop from perf_event documentation */
+    do {
+        seq = pc->lock;
+        __asm__ __volatile__("" ::: "memory");  /* Barrier */
+
+        count = pc->offset;
+        if (pc->index) {
+            __asm__ __volatile__("rdpmc" : "=a"(lo), "=d"(hi) : "c"(pmc_counters[idx].index));
+            count += ((uint64_t)hi << 32) | lo;
+        }
+
+        __asm__ __volatile__("" ::: "memory");  /* Barrier */
+    } while (pc->lock != seq);
+
+    return count;
 }
 
 /* Snapshot all active PMC counters into an array */
 static inline void pmc_snapshot(uint64_t *vals) {
     for (int i = 0; i < pmc_count; i++)
         vals[i] = read_pmc(i);
+}
+
+/* Print PMC counter summary */
+void pmc_summary(void) {
+    if (pmc_count == 0)
+        return;
+
+    printf("\n--- PMC Counter Summary ---\n");
+    for (int i = 0; i < pmc_count; i++) {
+        uint64_t val;
+        /* Use read() syscall instead of rdpmc for final summary */
+        if (read(pmc_counters[i].fd, &val, sizeof(val)) == sizeof(val)) {
+            printf("  %-16s: %lu\n", pmc_counters[i].name, val);
+        } else {
+            printf("  %-16s: ERROR reading counter\n", pmc_counters[i].name);
+        }
+    }
+    printf("\n");
 }
 
 /* Try to open a tracefs file, checking multiple paths */
@@ -1930,6 +1974,10 @@ int main(int argc, char **argv) {
     show_stats();
     if (config.show_histogram)
 	histogram_summary(config);
+
+    /* Print PMC counter summary before cleanup */
+    if (config.enable_pmc)
+        pmc_summary();
 
     /* Cleanup PMC counters */
     if (config.enable_pmc)
