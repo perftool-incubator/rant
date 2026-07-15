@@ -133,7 +133,26 @@ echo "  IRQ match:  *${irq_pattern}*"
 echo "  App CPU:    $cpu"
 echo "  IRQ CPU:    $irq_cpu"
 echo ""
-set -x
+
+# --- Lock CPU frequency to 2.6 GHz ---
+# Must be done BEFORE any tests to ensure stable, reproducible results.
+# Uses lock-frequency.sh to disable turbo, disable idle states, and lock at 2.6 GHz.
+# This runs ONCE per boot, not per-NIC, so we check if already done.
+if [[ -f /root/lock-frequency.sh ]]; then
+    current_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo "0")
+    turbo_disabled=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo "0")
+
+    if [[ "$current_freq" != "2600000" ]] || [[ "$turbo_disabled" != "1" ]]; then
+        { set +x; } 2>/dev/null
+        echo "=== Locking CPU frequency to 2.6 GHz ==="
+        bash /root/lock-frequency.sh 2.6 >/dev/null 2>&1
+        current_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo "unknown")
+        turbo_status=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo)
+        echo "  Frequency locked: $(( current_freq / 1000 )) MHz"
+        echo "  Turbo disabled: $turbo_status"
+        set -x
+    fi
+fi
 
 # --- SELinux AVC cache fix ---
 # Default AVC cache (512 entries) causes ~200-300us spikes when full.
@@ -193,7 +212,7 @@ $ns_cmd ethtool -K "$ifname" lro off gro off
 $ns_cmd ethtool -K "$ifname" tso off gso off
 $ns_cmd ethtool -C "$ifname" rx-frames 1 tx-frames 1
 $ns_cmd ethtool -C "$ifname" adaptive-tx off adaptive-rx off rx-usecs 0 tx-usecs 0
-$ns_cmd ethtool -G "$ifname" rx 128 tx 128
+$ns_cmd ethtool -G "$ifname" rx 64 tx 128
 $ns_cmd ethtool -g "$ifname"
 $ns_cmd ethtool -A "$ifname" rx off tx off
 
@@ -453,6 +472,20 @@ if [[ "$skip_ptp" -eq 0 && -n "$ptp_source" ]]; then
 fi
 
 { set +x; } 2>/dev/null
+echo ""
+echo "=== Final IRQ affinity verification ==="
+# Verify comp0 thread is on correct CPU (can drift during config)
+if [[ -n "$comp_thread" ]]; then
+    actual_cpu=$(ps -o psr= -p "$comp_thread" 2>/dev/null | tr -d ' ')
+    if [[ "$actual_cpu" != "$irq_cpu" ]]; then
+        echo "  WARNING: mlx5_comp0 drifted to CPU $actual_cpu, re-pinning to CPU $irq_cpu"
+        pin_irq_thread "$comp_thread" "$irq_cpu"
+        chrt -f -p "$irq_prio" "$comp_thread" >/dev/null 2>&1
+        actual_cpu=$(ps -o psr= -p "$comp_thread" 2>/dev/null | tr -d ' ')
+    fi
+    echo "  mlx5_comp0 (PID $comp_thread): CPU $actual_cpu (target: $irq_cpu)"
+fi
+
 echo ""
 echo "=== SUCCESS ==="
 echo "  Interface $ifname configured in namespace ns_${ifname}"
