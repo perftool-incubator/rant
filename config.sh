@@ -487,8 +487,90 @@ if [[ -n "$comp_thread" ]]; then
 fi
 
 echo ""
+echo "=== CRITICAL: Comprehensive NVMe/mpi3mr IRQ Demotion on ALL Test CPUs ==="
+# On RT kernel, NVMe/mpi3mr IRQ threads default to FIFO:50 after reboot.
+# These are managed IRQs (cannot be moved), but MUST be demoted to SCHED_OTHER
+# to prevent preemption of rant (FIFO:2).
+#
+# This is CRITICAL for valid baseline results. Without demotion:
+# - 36+ FIFO:50 threads can preempt rant (FIFO:2)
+# - Causes p50 regression from 5μs → 14μs
+# - Results are invalid and cannot be compared to baseline
+#
+# Check ALL test CPUs, not just the ones we're configuring now.
+# In a dual-NIC setup, both NICs share test CPUs and need comprehensive demotion.
+
+# Determine all test CPUs based on NUMA node 6 (typical for mlx5)
+# CPUs 49-52 are the standard test CPUs for NUMA 6
+TEST_CPUS="49 50 51 52"
+
+DEMOTED_COUNT=0
+FIFO_NVME_FOUND=0
+
+for test_cpu in $TEST_CPUS; do
+    # Find all NVMe/mpi3mr threads at FIFO priority on this test CPU
+    for pid in $(ps -eLo pid,psr,cls,comm | awk -v cpu="$test_cpu" '$2==cpu && $3=="FF" && $4~/nvme|mpi3mr/ {print $1}'); do
+        comm=$(cat /proc/$pid/comm 2>/dev/null)
+        # Check if it's actually FIFO (double-check)
+        sched=$(ps -o cls= -p $pid 2>/dev/null | tr -d ' ')
+        if [[ "$sched" == "FF" ]]; then
+            FIFO_NVME_FOUND=$((FIFO_NVME_FOUND + 1))
+            # Demote to SCHED_OTHER
+            if chrt -o -p 0 "$pid" 2>/dev/null; then
+                echo "  Demoted $comm (PID $pid) on CPU $test_cpu: FIFO:50 → SCHED_OTHER"
+                DEMOTED_COUNT=$((DEMOTED_COUNT + 1))
+            else
+                echo "  WARNING: Failed to demote $comm (PID $pid) on CPU $test_cpu"
+            fi
+        fi
+    done
+done
+
+if [[ $FIFO_NVME_FOUND -gt 0 ]]; then
+    echo "  Found $FIFO_NVME_FOUND FIFO NVMe/mpi3mr threads, demoted $DEMOTED_COUNT"
+else
+    echo "  ✓ No FIFO NVMe/mpi3mr threads found on test CPUs (good)"
+fi
+
+# Final verification - ensure NO FIFO NVMe/mpi3mr threads remain
+echo ""
+echo "=== Verifying NVMe/mpi3mr demotion ==="
+REMAINING=$(ps -eLo pid,psr,cls,comm | awk '$2>=49 && $2<=52 && $3=="FF"' | grep -E "nvme|mpi3mr" | wc -l)
+if [[ $REMAINING -eq 0 ]]; then
+    echo "  ✓ PASS - No FIFO NVMe/mpi3mr threads on test CPUs"
+else
+    echo "  ✗ FAIL - Still $REMAINING FIFO NVMe/mpi3mr threads on test CPUs!"
+    echo "  Listing remaining threads:"
+    ps -eLo pid,psr,cls,rtprio,comm | awk '$2>=49 && $2<=52 && $3=="FF"' | grep -E "nvme|mpi3mr" | head -10
+fi
+
+echo ""
+echo "=== Verifying NIC Coalescing Settings ==="
+# Verify rx-frames = 1 (critical for low jitter)
+# ethtool -C sets it, but verify it actually took effect
+RX_FRAMES=$($ns_cmd ethtool -c "$ifname" 2>/dev/null | grep "^rx-frames:" | awk '{print $2}')
+RX_USECS=$($ns_cmd ethtool -c "$ifname" 2>/dev/null | grep "^rx-usecs:" | awk '{print $2}')
+if [[ "$RX_FRAMES" == "1" ]]; then
+    echo "  ✓ rx-frames: 1 (correct)"
+else
+    echo "  ✗ WARNING: rx-frames: $RX_FRAMES (expected 1)"
+    echo "  Attempting to fix..."
+    $ns_cmd ethtool -C "$ifname" adaptive-rx off adaptive-tx off
+    $ns_cmd ethtool -C "$ifname" rx-frames 1 tx-frames 1
+    RX_FRAMES=$($ns_cmd ethtool -c "$ifname" 2>/dev/null | grep "^rx-frames:" | awk '{print $2}')
+    echo "  After fix: rx-frames: $RX_FRAMES"
+fi
+if [[ "$RX_USECS" == "0" ]]; then
+    echo "  ✓ rx-usecs: 0 (correct)"
+else
+    echo "  ✗ WARNING: rx-usecs: $RX_USECS (expected 0)"
+fi
+
+echo ""
 echo "=== SUCCESS ==="
 echo "  Interface $ifname configured in namespace ns_${ifname}"
 echo "  IP: ${ip_addr}/24, Remote: ${remote_ip}"
 echo "  App CPU: $cpu, IRQ CPU: $irq_cpu"
+echo "  NVMe/mpi3mr: Verified demoted on test CPUs"
+echo "  rx-frames: $RX_FRAMES, rx-usecs: $RX_USECS"
 echo ""
