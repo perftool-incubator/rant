@@ -58,10 +58,8 @@ typedef struct {
     int enable_pmc;
     int no_tx_ts;
     int no_hw_ts;
-    int no_sw_ts;      /* Skip software timestamps (clock_gettime) */
     int fast_path;
     int threaded;
-    int enable_rdtsc_checkpoints;  /* Use RDTSC for detailed checkpoints instead of CLOCK_TAI */
 } config_t;
 
 uint64_t *histogram = NULL;
@@ -74,7 +72,7 @@ int using_hugepages_overflow = 0;  // Track if overflow used hugepages
 
 struct record {
     struct timespec hw_tx, hw_rx;
-    struct timespec sw_tx, sw_rx;  /* CLOCK_TAI timestamps (same clock as HW) */
+    uint64_t sw_tx, sw_rx;  /* RDTSC cycles — converted to ns at output */
     uint64_t delta;
 };
 
@@ -150,11 +148,6 @@ static inline uint64_t rdtsc_to_tai_ns(uint64_t tsc) {
     int64_t delta_cycles = (int64_t)(tsc - rdtsc_ref);
     int64_t delta_ns = delta_cycles * (int64_t)1000000000LL / (int64_t)cycles_per_sec;
     return tai_ref_ns + delta_ns;
-}
-
-/* Get SW timestamp (CLOCK_REALTIME to match system time) */
-static inline void get_sw_timestamp(struct timespec *ts) {
-    clock_gettime(CLOCK_REALTIME, ts);
 }
 
 /* --- Hardware Performance Counter (PMC) support via rdpmc --- */
@@ -580,19 +573,9 @@ void emit(config_t cfg) {
         /* Use warmup_record as scratch; log_book write is deferred until after delta is known */
         rtt = &warmup_record;
 
-        /* T1_SW: CLOCK_TAI before sendto (or RDTSC if checkpoints enabled) */
-        if (!cfg.no_sw_ts) {
-            if (cfg.enable_rdtsc_checkpoints) {
-                uint64_t tsc = rdtsc();
-                tsc_pre_sendto = tsc;
-                uint64_t tai_ns = rdtsc_to_tai_ns(tsc);
-                rtt->sw_tx.tv_sec = tai_ns / 1000000000ULL;
-                rtt->sw_tx.tv_nsec = tai_ns % 1000000000ULL;
-            } else {
-                get_sw_timestamp(&rtt->sw_tx);
-            }
-        }
-        tsc_pre_sendto = rdtsc();  /* For RDTSC-based throughput calculation */
+        /* T1_SW: RDTSC before sendto */
+        rtt->sw_tx = rdtsc();
+        tsc_pre_sendto = rtt->sw_tx;
 
         /* Send Ping */
         sendto(s, buf, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
@@ -625,22 +608,11 @@ void emit(config_t cfg) {
         if (!keep_running) break;
         tsc_poll_rx = rdtsc();
 
-        /* Receive Pong — T4_HW from cmsg, T4_SW from CLOCK_TAI */
+        /* Receive Pong — T4_HW from cmsg, T4_SW from RDTSC */
         tsc_pre_recvmsg = rdtsc();
         recvmsg(s, &msg_rx, 0);
         tsc_recvmsg = rdtsc();
-
-        /* T4_SW: CLOCK_TAI after recvmsg (or RDTSC if checkpoints enabled) */
-        if (!cfg.no_sw_ts) {
-            if (cfg.enable_rdtsc_checkpoints) {
-                uint64_t tai_ns = rdtsc_to_tai_ns(tsc_recvmsg);
-                rtt->sw_rx.tv_sec = tai_ns / 1000000000ULL;
-                rtt->sw_rx.tv_nsec = tai_ns % 1000000000ULL;
-            } else {
-                get_sw_timestamp(&rtt->sw_rx);
-            }
-        }
-
+        rtt->sw_rx = tsc_recvmsg;
         if (!cfg.no_hw_ts) {
             get_ts(&msg_rx, &rtt->hw_rx);
         }
@@ -678,8 +650,8 @@ void emit(config_t cfg) {
                        rtt->delta, cfg.threshold);
                 printf("  T1_HW (NIC tx):  %ld.%09ld\n", rtt->hw_tx.tv_sec, rtt->hw_tx.tv_nsec);
                 printf("  T4_HW (NIC rx):  %ld.%09ld\n", rtt->hw_rx.tv_sec, rtt->hw_rx.tv_nsec);
-                printf("  T1_SW (sendto):  %ld.%09ld\n", rtt->sw_tx.tv_sec, rtt->sw_tx.tv_nsec);
-                printf("  T4_SW (recvmsg): %ld.%09ld\n", rtt->sw_rx.tv_sec, rtt->sw_rx.tv_nsec);
+                printf("  T1_SW (RDTSC):   %"PRIu64"\n", rtt->sw_tx);
+                printf("  T4_SW (RDTSC):   %"PRIu64"\n", rtt->sw_rx);
                 printf("  --- RDTSC breakdown ---\n");
                 printf("    sendto syscall:     %"PRIu64" ns\n",
                        (uint64_t)((tsc_sendto - tsc_pre_sendto) * 1000000000ULL / cycles_per_sec));
@@ -865,22 +837,8 @@ void reflect(config_t cfg) {
 
             /* Deferred bookkeeping — all after send */
             tsc_recvmsg = tsc_pre_recvmsg;
-
-            /* Set SW timestamps based on mode */
-            if (!cfg.no_sw_ts) {
-                if (cfg.enable_rdtsc_checkpoints) {
-                    uint64_t tai_rx_ns = rdtsc_to_tai_ns(tsc_pre_recvmsg);
-                    resp->sw_rx.tv_sec = tai_rx_ns / 1000000000ULL;
-                    resp->sw_rx.tv_nsec = tai_rx_ns % 1000000000ULL;
-                    uint64_t tai_tx_ns = rdtsc_to_tai_ns(tsc_sendto);
-                    resp->sw_tx.tv_sec = tai_tx_ns / 1000000000ULL;
-                    resp->sw_tx.tv_nsec = tai_tx_ns % 1000000000ULL;
-                } else {
-                    get_sw_timestamp(&resp->sw_rx);
-                    get_sw_timestamp(&resp->sw_tx);
-                }
-            }
-
+            resp->sw_rx = tsc_pre_recvmsg;
+            resp->sw_tx = tsc_sendto;
             tsc_poll = tsc_pre_recvmsg;
             tsc_get_ts = tsc_pre_recvmsg;
             tsc_pre_sendto = tsc_pre_recvmsg;
@@ -896,52 +854,23 @@ void reflect(config_t cfg) {
             tsc_poll = rdtsc();
             pmc_snapshot(pmc_post_poll);
 
-            /* Receive ping — T2_HW from cmsg, T2_SW after recvmsg */
+            /* Receive ping — T2_HW from cmsg, T2_SW from RDTSC */
             pmc_snapshot(pmc_pre_recvmsg);
             tsc_pre_recvmsg = rdtsc();
             recvmsg(s, &msg_rx, 0);
             tsc_recvmsg = rdtsc();
             pmc_snapshot(pmc_post_recvmsg);
-
+            resp->sw_rx = tsc_poll;  /* T2_SW = after poll (packet ready) */
             if (!cfg.no_hw_ts)
                 get_ts(&msg_rx, &resp->hw_rx);
-
-            /* T2_SW = after recvmsg/get_ts (for clock sync with HW) - use CLOCK_REALTIME or RDTSC */
-            if (!cfg.no_sw_ts) {
-                if (cfg.enable_rdtsc_checkpoints) {
-                    uint64_t tai_ns = rdtsc_to_tai_ns(tsc_poll);
-                    resp->sw_rx.tv_sec = tai_ns / 1000000000ULL;
-                    resp->sw_rx.tv_nsec = tai_ns % 1000000000ULL;
-                } else {
-                    get_sw_timestamp(&resp->sw_rx);
-                }
-            }
-
             tsc_get_ts = rdtsc();
 
-            /* Send pong — T3_SW from CLOCK_TAI */
+            /* Send pong — T3_SW from RDTSC */
             pmc_snapshot(pmc_pre_sendto);
             tsc_pre_sendto = rdtsc();
-
-            /* T3_SW = BEFORE sendto (to get positive delta vs T3_HW) */
-            if (!cfg.no_sw_ts) {
-                if (!cfg.enable_rdtsc_checkpoints) {
-                    get_sw_timestamp(&resp->sw_tx);
-                }
-            }
-
             sendto(s, buf, 1, 0, (struct sockaddr *)&client_addr, client_len);
             tsc_sendto = rdtsc();
-
-            /* T3_SW for RDTSC mode = after sendto (for detailed breakdown) */
-            if (!cfg.no_sw_ts) {
-                if (cfg.enable_rdtsc_checkpoints) {
-                    uint64_t tai_ns = rdtsc_to_tai_ns(tsc_sendto);
-                    resp->sw_tx.tv_sec = tai_ns / 1000000000ULL;
-                    resp->sw_tx.tv_nsec = tai_ns % 1000000000ULL;
-                }
-            }
-
+            resp->sw_tx = tsc_sendto;  /* T3_SW = after sendto (response queued) */
             pmc_snapshot(pmc_post_sendto);
 
             if (!cfg.no_tx_ts) {
@@ -1031,34 +960,9 @@ void reflect(config_t cfg) {
                 printf("  T2_HW (NIC rx):  %ld.%09ld\n", resp->hw_rx.tv_sec, resp->hw_rx.tv_nsec);
                 if (!cfg.no_tx_ts)
                     printf("  T3_HW (NIC tx):  %ld.%09ld\n", resp->hw_tx.tv_sec, resp->hw_tx.tv_nsec);
-
-                /* SW timestamps are already in CLOCK_TAI (struct timespec) */
-                printf("  T2_SW (poll ret): %ld.%09ld\n", resp->sw_rx.tv_sec, resp->sw_rx.tv_nsec);
-                printf("  T3_SW (sendto ret): %ld.%09ld\n", resp->sw_tx.tv_sec, resp->sw_tx.tv_nsec);
-
-                /* Calculate the three critical deltas using timespec */
-                int64_t t2_sw_ns = (int64_t)resp->sw_rx.tv_sec * 1000000000LL + (int64_t)resp->sw_rx.tv_nsec;
-                int64_t t3_sw_ns = (int64_t)resp->sw_tx.tv_sec * 1000000000LL + (int64_t)resp->sw_tx.tv_nsec;
-                int64_t t2_hw_ns = (int64_t)resp->hw_rx.tv_sec * 1000000000LL + (int64_t)resp->hw_rx.tv_nsec;
-
-                int64_t rx_path_ns = t2_sw_ns - t2_hw_ns;
-                int64_t app_proc_ns = t3_sw_ns - t2_sw_ns;
-                int64_t tx_path_ns = 0;
-                if (!cfg.no_tx_ts) {
-                    int64_t t3_hw_ns = (int64_t)resp->hw_tx.tv_sec * 1000000000LL + (int64_t)resp->hw_tx.tv_nsec;
-                    tx_path_ns = t3_hw_ns - t3_sw_ns;
-                }
-
-                printf("  --- Server breakdown ---\n");
-                printf("    RX path (T2_SW - T2_HW):        %"PRId64" ns\n", rx_path_ns);
-                printf("    App processing (T3_SW - T2_SW): %"PRId64" ns\n", app_proc_ns);
-                if (!cfg.no_tx_ts)
-                    printf("    TX path (T3_HW - T3_SW):        %"PRId64" ns\n", tx_path_ns);
             }
-            /* Calculate app processing time from struct timespec */
-            int64_t t2_sw_ns = (int64_t)resp->sw_rx.tv_sec * 1000000000LL + (int64_t)resp->sw_rx.tv_nsec;
-            int64_t t3_sw_ns = (int64_t)resp->sw_tx.tv_sec * 1000000000LL + (int64_t)resp->sw_tx.tv_nsec;
-            printf("  App processing (T3_SW - T2_SW): %"PRId64" ns\n", t3_sw_ns - t2_sw_ns);
+            printf("  App processing (T3_SW - T2_SW): %"PRIu64" ns\n",
+                   (uint64_t)((resp->sw_tx - resp->sw_rx) * 1000000000ULL / cycles_per_sec));
             printf("  --- RDTSC breakdown ---\n");
             if (tsc_prev_loop_end > 0)
                 printf("    prev_end→poll_start: %"PRIu64" ns\n",
@@ -1177,13 +1081,14 @@ void roundtrip_log(const char *filename) {
 
         for (size_t n = 0; n < count; n++) {
             size_t i = (start + n) % log_capacity;
-            /* SW timestamps are now struct timespec (CLOCK_TAI) */
+            uint64_t sw_tx_ns = rdtsc_to_tai_ns(log_book[i].sw_tx);
+            uint64_t sw_rx_ns = rdtsc_to_tai_ns(log_book[i].sw_rx);
             fprintf(fp, "%10zu %20ld.%09ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %15"PRIu64"\n",
                 seq_base + n,
-                log_book[i].sw_tx.tv_sec, log_book[i].sw_tx.tv_nsec,
+                (long)(sw_tx_ns / 1000000000ULL), (long)(sw_tx_ns % 1000000000ULL),
                 log_book[i].hw_tx.tv_sec, log_book[i].hw_tx.tv_nsec,
                 log_book[i].hw_rx.tv_sec, log_book[i].hw_rx.tv_nsec,
-                log_book[i].sw_rx.tv_sec, log_book[i].sw_rx.tv_nsec,
+                (long)(sw_rx_ns / 1000000000ULL), (long)(sw_rx_ns % 1000000000ULL),
                 log_book[i].delta);
         }
     }
@@ -1213,12 +1118,13 @@ void response_log(const char *filename) {
 
         for (size_t n = 0; n < count; n++) {
             size_t i = (start + n) % log_capacity;
-            /* SW timestamps are now struct timespec (CLOCK_TAI) */
+            uint64_t sw_rx_ns = rdtsc_to_tai_ns(log_book[i].sw_rx);
+            uint64_t sw_tx_ns = rdtsc_to_tai_ns(log_book[i].sw_tx);
             fprintf(fp, "%10zu %20ld.%09ld %20ld.%09ld %20ld.%09ld %20ld.%09ld %15"PRIu64"\n",
                 seq_base + n,
                 log_book[i].hw_rx.tv_sec, log_book[i].hw_rx.tv_nsec,
-                log_book[i].sw_rx.tv_sec, log_book[i].sw_rx.tv_nsec,
-                log_book[i].sw_tx.tv_sec, log_book[i].sw_tx.tv_nsec,
+                (long)(sw_rx_ns / 1000000000ULL), (long)(sw_rx_ns % 1000000000ULL),
+                (long)(sw_tx_ns / 1000000000ULL), (long)(sw_tx_ns % 1000000000ULL),
                 log_book[i].hw_tx.tv_sec, log_book[i].hw_tx.tv_nsec,
                 log_book[i].delta);
         }
@@ -1253,9 +1159,6 @@ void print_usage(const char *progname) {
     printf("  -M, --pmc                     Enable hardware performance counter (rdpmc) instrumentation\n");
     printf("  -N, --no-tx-ts                Skip TX timestamp retrieval (server only, reduces latency)\n");
     printf("  -R, --no-hw-ts                Disable all HW timestamps, use RDTSC only for T1/T2/T3/T4\n");
-    printf("  -K, --no-sw-ts                Skip software timestamps (clock_gettime), use only HW timestamps\n");
-    printf("                                  Cannot be used with -R (need at least one timestamp source)\n");
-    printf("  -c, --rdtsc-checkpoints       Use RDTSC for detailed checkpoints instead of CLOCK_TAI\n");
     printf("  -F, --fast-path               Cache-warming optimizations (server: connect+send, tight loop, no RX ts, prefetch)\n");
     printf("  -2, --threaded                Split send/receive into separate threads (needs 3 CPUs via taskset)\n");
     printf("  -h, --help                    Show this help message\n");
@@ -1380,13 +1283,8 @@ static void *srv_send_thread(void *arg) {
         if (log_book != NULL &&
             (ctx->cfg.log_threshold == 0 || delta_ns > ctx->cfg.log_threshold)) {
             if (log_size < log_capacity) {
-                /* Convert RDTSC to timespec for threaded mode */
-                uint64_t tai_rx_ns = rdtsc_to_tai_ns(tsc_recv_snap);
-                log_book[log_size].sw_rx.tv_sec = tai_rx_ns / 1000000000ULL;
-                log_book[log_size].sw_rx.tv_nsec = tai_rx_ns % 1000000000ULL;
-                uint64_t tai_tx_ns = rdtsc_to_tai_ns(tsc_sendto);
-                log_book[log_size].sw_tx.tv_sec = tai_tx_ns / 1000000000ULL;
-                log_book[log_size].sw_tx.tv_nsec = tai_tx_ns % 1000000000ULL;
+                log_book[log_size].sw_rx = tsc_recv_snap;
+                log_book[log_size].sw_tx = tsc_sendto;
                 log_book[log_size].delta = delta_ns;
             }
             log_size++;
@@ -1559,13 +1457,8 @@ static void *cli_recv_thread(void *arg) {
         if (log_book != NULL &&
             (ctx->cfg.log_threshold == 0 || delta_ns > ctx->cfg.log_threshold)) {
             if (log_size < log_capacity) {
-                /* Convert RDTSC to timespec for threaded mode */
-                uint64_t tai_tx_ns = rdtsc_to_tai_ns(tsc_send_snap);
-                log_book[log_size].sw_tx.tv_sec = tai_tx_ns / 1000000000ULL;
-                log_book[log_size].sw_tx.tv_nsec = tai_tx_ns % 1000000000ULL;
-                uint64_t tai_rx_ns = rdtsc_to_tai_ns(tsc_recvmsg);
-                log_book[log_size].sw_rx.tv_sec = tai_rx_ns / 1000000000ULL;
-                log_book[log_size].sw_rx.tv_nsec = tai_rx_ns % 1000000000ULL;
+                log_book[log_size].sw_tx = tsc_send_snap;
+                log_book[log_size].sw_rx = tsc_recvmsg;
                 log_book[log_size].delta = delta_ns;
             }
             log_size++;
@@ -1689,8 +1582,6 @@ int main(int argc, char **argv) {
         {"continue",         no_argument,       0, 'C'},
         {"no-tx-ts",         no_argument,       0, 'N'},
         {"no-hw-ts",         no_argument,       0, 'R'},
-        {"no-sw-ts",         no_argument,       0, 'K'},
-        {"rdtsc-checkpoints", no_argument,      0, 'c'},
         {"fast-path",        no_argument,       0, 'F'},
         {"threaded",         no_argument,       0, '2'},
         {"busy-poll-us",     required_argument, 0, 'p'},
@@ -1699,7 +1590,7 @@ int main(int argc, char **argv) {
     };
 
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSHl:GB:PvML:CNp:RKF2ch", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "d:w:o:b:i:a:t:TSHl:GB:PvML:CNp:RF2h", long_options, &option_index)) != -1) {
         switch (opt) {
 	    case 'd':
 		uint64_t duration_sec = atoll(optarg);
@@ -1808,9 +1699,6 @@ int main(int argc, char **argv) {
 		config.no_hw_ts = 1;
 		config.no_tx_ts = 1;  /* implies no TX timestamps too */
 		break;
-	    case 'K':  // --no-sw-ts
-		config.no_sw_ts = 1;
-		break;
 	    case 'F':  // --fast-path
 		config.fast_path = 1;
 		config.no_tx_ts = 1;  /* fast path implies no TX timestamps */
@@ -1820,9 +1708,6 @@ int main(int argc, char **argv) {
 		break;
 	    case 'p':  // --busy-poll-us
 		config.busy_poll_us = atoi(optarg);
-		break;
-	    case 'c':  // --rdtsc-checkpoints
-		config.enable_rdtsc_checkpoints = 1;
 		break;
 	    case 'h':
 		print_usage(argv[0]);
@@ -1835,13 +1720,6 @@ int main(int argc, char **argv) {
 
     if (config.iface == NULL) {
 	print_usage(argv[0]);
-	return 1;
-    }
-
-    /* Validate timestamp flag combinations */
-    if (config.no_sw_ts && config.no_hw_ts) {
-	fprintf(stderr, "Error: Cannot use -K (--no-sw-ts) and -R (--no-hw-ts) together.\n");
-	fprintf(stderr, "       At least one timestamp source (HW or SW) must be enabled.\n");
 	return 1;
     }
 
