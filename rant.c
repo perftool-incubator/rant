@@ -1840,12 +1840,16 @@ int main(int argc, char **argv) {
         if (config.duration > 0) {
             duration_for_capacity = config.duration;
         } else {
-            /* Default: 1 hour worth of samples (~25GB with cache alignment) */
-            duration_for_capacity = 3600;
+            /* Default: no -d given, assume a 1h test but pad 10% (66 min worth)
+             * since the actual test may run slightly longer than assumed. */
+            duration_for_capacity = (uint64_t)(3600 * 1.10);
         }
 
-        uint64_t expected_samples = duration_for_capacity * 50000;  /* Assume 50k samples/sec */
-        log_capacity = (size_t)(expected_samples * 1.15);  /* Add 15% buffer */
+        /* 100k pps: above our measured baseline (~82k pps), well below theoretical
+         * 200Gb-NIC/1-byte-packet wire rate (~297.6M pps, which would need
+         * multi-petabyte buffers and isn't a realistic sizing target). */
+        uint64_t expected_samples = duration_for_capacity * 100000;
+        log_capacity = (size_t)(expected_samples * 1.15);  /* Add 15% buffer for rate variance */
         log_book_bytes = log_capacity * sizeof(struct record);
 
         size_t required_gb = log_book_bytes / (1024ULL * 1024 * 1024);
