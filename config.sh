@@ -380,12 +380,15 @@ fi
 
 if [[ -n "$async_thread" ]]; then
     # Pin async0 (firmware/link events, fires ~never during normal operation) to
-    # $irq_cpu, same CPU as comp0 -- matches the exact config used by the Aug 21-22
-    # 2026 tscfix campaign (the best-ever result, MAX 21.85us avg). A CPU48 placement
-    # was tested Sep 1 2026 and looked best in short (10min) A/B trials, but that
-    # result did not hold up under longer runs, so reverted to match the known-good
-    # historical config for apples-to-apples comparison.
-    ASYNC0_CPU="$irq_cpu"
+    # CPU48 (NUMA6 housekeeping) rather than $irq_cpu (comp0's dedicated CPU). It has
+    # no latency requirement, so there's no benefit to colocating it with the busy
+    # comp0 IRQ CPU. Tested against $irq_cpu (matches Aug 21-22 tscfix run) and a
+    # CPU53/54 split in 10min trials Sep 1-2 2026 -- all three placements landed
+    # within noise of each other at 10min scale, no placement demonstrated a
+    # reproducible advantage. Keeping CPU48 as the default: NUMA-local, and keeps
+    # both the critical-path (49-52) and quiet-isolated (53-55, relevant to the
+    # separate nohz_full tick-stuck investigation) CPUs completely untouched.
+    ASYNC0_CPU=48
     pin_irq_thread "$async_thread" "$ASYNC0_CPU"
     chrt -f -p "$ksoftirqd_prio" "$async_thread"
     { set +x; } 2>/dev/null
