@@ -129,6 +129,17 @@ uint64_t cycles_per_sec = 0;
 uint64_t rdtsc_ref = 0;        /* RDTSC value at anchor point */
 uint64_t tai_ref_ns = 0;       /* CLOCK_TAI nanoseconds at anchor point */
 
+/* CLOCK_MONOTONIC anchor for duration verification */
+struct timespec monotonic_start;
+uint64_t duration_sec;  /* configured -d value, shared for monotonic check */
+
+static inline int duration_elapsed_monotonic(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t elapsed = (now.tv_sec - monotonic_start.tv_sec);
+    return elapsed >= duration_sec;
+}
+
 void calibrate_rdtsc() {
     struct timespec sleep_time = {1, 0};
     uint64_t start = rdtsc();
@@ -389,7 +400,8 @@ void histogram_record(long long delta, config_t cfg) {
     stats.count++;
     uint32_t bucket_index = (uint32_t) delta / cfg.bucket_size;
     if (bucket_index >= bucket_max) {
-        overflow_samples[histogram[bucket_max]]=delta;
+        if (histogram[bucket_max] < overflow_capacity)
+            overflow_samples[histogram[bucket_max]]=delta;
 	bucket_index = bucket_max;
     }
     histogram[bucket_index]++;
@@ -422,10 +434,12 @@ uint64_t get_percentile(double percentile, config_t cfg) {
     }
 
     /* overflow bucket logic (target sample is in the overflow bucket) */
+    uint64_t stored_overflow = histogram[bucket_max] < overflow_capacity ?
+        histogram[bucket_max] : overflow_capacity;
     uint64_t index = target - running_sum - 1;
     if (index < 0) index = 0;
-    if (index >= histogram[bucket_max]) index = histogram[bucket_max] - 1;
-    qsort(overflow_samples, histogram[bucket_max], sizeof(uint64_t), compare_samples);
+    if (index >= stored_overflow) index = stored_overflow - 1;
+    qsort(overflow_samples, stored_overflow, sizeof(uint64_t), compare_samples);
     /* Return the exact value recorded from the overflow bucket */
     return (uint64_t) overflow_samples[index] / 1e3;
 }
@@ -557,6 +571,8 @@ void emit(config_t cfg) {
         /* Start timing when warmup completes, before first test packet */
         if (packet_count == cfg.warmup) {
             test_start_tsc = rdtsc();
+            clock_gettime(CLOCK_MONOTONIC, &monotonic_start);
+            duration_sec = cfg.duration;
             if (trace_marker_fd >= 0) {
                 char marker[128];
                 struct timespec now;
@@ -688,13 +704,16 @@ void emit(config_t cfg) {
             }
         }
 
-        /* check if duration timed out */
-        if (cfg.duration > 0 && rdtsc() > deadline)
+        /* check if duration timed out — TSC check, confirmed by CLOCK_MONOTONIC */
+        if (cfg.duration > 0 && rdtsc() > deadline && duration_elapsed_monotonic())
             break;
     }
 
-    uint64_t duration_cycles = rdtsc() - test_start_tsc;
-    printf("Test is complete. Duration: %.2f s\n", (double)duration_cycles / cycles_per_sec);
+    struct timespec monotonic_end;
+    clock_gettime(CLOCK_MONOTONIC, &monotonic_end);
+    double wall_duration = (monotonic_end.tv_sec - monotonic_start.tv_sec) +
+                           (monotonic_end.tv_nsec - monotonic_start.tv_nsec) / 1e9;
+    printf("Test is complete. Duration: %.2f s\n", wall_duration);
 }
 
 /* Reflect: send back round trip pkt (server) */
@@ -1438,6 +1457,8 @@ static void *cli_recv_thread(void *arg) {
         packet_count++;
         if (packet_count == ctx->cfg.warmup) {
             test_start_tsc = rdtsc();
+            clock_gettime(CLOCK_MONOTONIC, &monotonic_start);
+            duration_sec = ctx->cfg.duration;
             deadline = ctx->cfg.duration > 0 ?
                 test_start_tsc + ctx->cfg.duration * cycles_per_sec : 0;
             if (ctx->cfg.warmup > 0)
@@ -1473,13 +1494,15 @@ static void *cli_recv_thread(void *arg) {
             }
         }
 
-        if (deadline > 0 && tsc_recvmsg > deadline) break;
+        if (deadline > 0 && tsc_recvmsg > deadline && duration_elapsed_monotonic()) break;
     }
 
 done:;
-    uint64_t duration_cycles = rdtsc() - test_start_tsc;
-    printf("Test is complete. Duration: %.2f s\n",
-           (double)duration_cycles / cycles_per_sec);
+    struct timespec monotonic_end;
+    clock_gettime(CLOCK_MONOTONIC, &monotonic_end);
+    double wall_duration = (monotonic_end.tv_sec - monotonic_start.tv_sec) +
+                           (monotonic_end.tv_nsec - monotonic_start.tv_nsec) / 1e9;
+    printf("Test is complete. Duration: %.2f s\n", wall_duration);
     return NULL;
 }
 
@@ -1898,7 +1921,7 @@ int main(int argc, char **argv) {
     histogram = calloc(bucket_max+1, sizeof(uint64_t));
     if (histogram == NULL) return 1;
 
-    /* Allocate overflow_samples (4GB array) */
+    /* Allocate overflow_samples (sized for realistic overflow counts, not worst-case) */
     overflow_samples_bytes = overflow_capacity * sizeof(uint64_t);
 
     if (config.use_hugepages) {
@@ -1930,13 +1953,15 @@ int main(int argc, char **argv) {
                 overflow_samples_bytes / (1024.0 * 1024.0 * 1024.0),
                 using_hugepages_overflow ? "hugepages" : "calloc");
 
-    /* Lock all memory pages in RAM to prevent page faults during test */
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-        perror("mlockall");
-        fprintf(stderr, "Warning: Cannot lock memory. May experience page fault delays.\n");
-        fprintf(stderr, "Try: ulimit -l unlimited or sudo setcap cap_ipc_lock=+ep %s\n", argv[0]);
-    } else if (verbose) {
-        fprintf(stderr, "✅ Memory locked (mlockall)\n");
+    /* Lock all memory pages in RAM to prevent page faults during test (only when logging to file) */
+    if (config.log_file) {
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+            perror("mlockall");
+            fprintf(stderr, "Warning: Cannot lock memory. May experience page fault delays.\n");
+            fprintf(stderr, "Try: ulimit -l unlimited or sudo setcap cap_ipc_lock=+ep %s\n", argv[0]);
+        } else if (verbose) {
+            fprintf(stderr, "✅ Memory locked (mlockall)\n");
+        }
     }
 
     if (verbose)
