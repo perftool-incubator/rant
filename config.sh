@@ -47,7 +47,7 @@ remote_ip=""
 remote_mac=""
 cpu=""
 irq_cpu=""
-busy_poll=60
+busy_poll=50
 ptp_source=""
 ptp_sync_to=""
 skip_namespace=0
@@ -93,6 +93,48 @@ ip link show "$ifname" &>/dev/null || \
     ip netns exec "ns_${ifname}" ip link show "$ifname" &>/dev/null || \
     die "Interface $ifname not found"
 
+# --- Disable irqbalance (system-wide, idempotent) ---
+if systemctl is-active irqbalance &>/dev/null; then
+    echo "=== Disabling irqbalance ==="
+    systemctl stop irqbalance
+    systemctl disable irqbalance 2>/dev/null || true
+    systemctl mask irqbalance 2>/dev/null || true
+    echo "  irqbalance: stopped and masked"
+elif ! systemctl is-enabled irqbalance &>/dev/null 2>&1; then
+    : # already disabled/masked
+else
+    systemctl mask irqbalance 2>/dev/null || true
+fi
+
+# --- Disable known sources of periodic/background noise (idempotent) ---
+# fwupd: D-Bus-activatable firmware update daemon + periodic metadata refresh timer.
+#        Not needed on a dedicated test rig; discovered Sep 1, 2026 as a random-noise risk.
+# crond: /etc/cron.d/0hourly fires every hour on the hour (run-parts /etc/cron.hourly ->
+#        anacron -s), doing disk I/O + /sys/class/power_supply/* traversal. Directly
+#        relevant to rare (~1/2-3h) tail-latency spikes under investigation.
+# mcelog: foreground daemon, confirmed actively running (ConditionPathExists=/dev/mcelog
+#         is met on this hardware); periodic MCE polling is unnecessary noise for latency
+#         testing (matches existing smartd/rhsmcertd disable rationale).
+# smartd/rhsmcertd: previously only stopped inside individual 8h-campaign wrapper scripts,
+#         not persistently -- any ad-hoc/short test run outside those wrappers left them
+#         running. Moved here so config.sh alone is sufficient (discovered Sep 1, 2026).
+for svc in fwupd.service fwupd-refresh.service fwupd-refresh.timer fwupd-offline-update.service \
+           crond.service mcelog.service smartd.service rhsmcertd.service; do
+    if systemctl is-active "$svc" &>/dev/null || ! systemctl is-enabled "$svc" &>/dev/null 2>&1; then
+        systemctl stop "$svc" 2>/dev/null || true
+    fi
+    systemctl mask "$svc" 2>/dev/null || true
+done
+echo "  Masked periodic/background noise sources: fwupd (+refresh/offline-update), crond, mcelog, smartd, rhsmcertd"
+
+# --- Unmanage test interface from NetworkManager ---
+if command -v nmcli &>/dev/null && nmcli device status &>/dev/null 2>&1; then
+    if nmcli device status 2>/dev/null | grep -q "^${ifname}[[:space:]]"; then
+        nmcli device set "$ifname" managed no 2>/dev/null || true
+        echo "=== NetworkManager: ${ifname} set to unmanaged ==="
+    fi
+fi
+
 set -x
 
 # --- Auto-discover hardware properties ---
@@ -134,18 +176,18 @@ echo "  App CPU:    $cpu"
 echo "  IRQ CPU:    $irq_cpu"
 echo ""
 
-# --- Lock CPU frequency to 2.6 GHz ---
+# --- Lock CPU frequency to 3.4 GHz ---
 # Must be done BEFORE any tests to ensure stable, reproducible results.
-# Uses lock-frequency.sh to disable turbo, disable idle states, and lock at 2.6 GHz.
+# Uses lock-frequency.sh to disable turbo, disable idle states, and lock at 3.4 GHz.
 # This runs ONCE per boot, not per-NIC, so we check if already done.
 if [[ -f /root/lock-frequency.sh ]]; then
     current_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo "0")
     turbo_disabled=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo "0")
 
-    if [[ "$current_freq" != "2600000" ]] || [[ "$turbo_disabled" != "1" ]]; then
+    if [[ "$current_freq" != "3400000" ]] || [[ "$turbo_disabled" != "1" ]]; then
         { set +x; } 2>/dev/null
-        echo "=== Locking CPU frequency to 2.6 GHz ==="
-        bash /root/lock-frequency.sh 2.6 >/dev/null 2>&1
+        echo "=== Locking CPU frequency to 3.4 GHz ==="
+        bash /root/lock-frequency.sh 3.4 >/dev/null 2>&1
         current_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null || echo "unknown")
         turbo_status=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo)
         echo "  Frequency locked: $(( current_freq / 1000 )) MHz"
@@ -337,12 +379,20 @@ else
 fi
 
 if [[ -n "$async_thread" ]]; then
-    # Set async0 (firmware events) priority
-    pin_irq_thread "$async_thread" "$irq_cpu"
+    # Pin async0 (firmware/link events, fires ~never during normal operation) to CPU48
+    # (NUMA6 housekeeping) rather than $irq_cpu (comp0's dedicated CPU). It has no
+    # latency requirement, so there's no benefit to colocating it with the busy comp0
+    # IRQ CPU -- doing so only creates a rare, pointless contention risk. CPU48 keeps
+    # it NUMA-local without touching the critical-path (49-52) or quiet-isolated (53-55)
+    # CPUs. Empirically confirmed best of 4 placements tested (CPU0/51-52/53-55/48),
+    # Sep 1, 2026: lowest MAX and lowest tail-event rate in a 10min A/B/C/D comparison.
+    ASYNC0_CPU=48
+    pin_irq_thread "$async_thread" "$ASYNC0_CPU"
     chrt -f -p "$ksoftirqd_prio" "$async_thread"
     { set +x; } 2>/dev/null
     echo "=== mlx5_async0 (firmware events) ==="
     echo "  PID:      $async_thread"
+    echo "  CPU:      $(cat /proc/$async_thread/status 2>/dev/null | grep Cpus_allowed_list)"
     echo "  Priority: $(chrt -p $async_thread)"
     set -x
 fi
@@ -386,8 +436,9 @@ mkdir -p "$state_dir"
 # Save our comp0/async0 state so the sibling config.sh run can restore us
 { set +x; } 2>/dev/null
 echo "$irq_cpu $irq_prio $comp_thread" > "$state_dir/${pci}_comp0"
+echo "$ifname" > "$state_dir/${pci}_ifname"
 if [[ -n "$async_thread" ]]; then
-    echo "$irq_cpu $ksoftirqd_prio $async_thread" > "$state_dir/${pci}_async0"
+    echo "$ASYNC0_CPU $ksoftirqd_prio $async_thread" > "$state_dir/${pci}_async0"
 fi
 
 # Check if sibling port was already configured — if so, restore its affinity
@@ -420,6 +471,25 @@ for state_file in "$state_dir/${pci_bus}."*_async0; do
         chrt -f -p "$sib_prio" "$sib_pid" 2>/dev/null
     fi
 done
+
+# Re-apply ethtool coalescing on sibling (ethtool -L resets tx-frames to default 32)
+for state_file in "$state_dir/${pci_bus}."*_ifname; do
+    [[ -f "$state_file" ]] || continue
+    [[ "$state_file" == "$state_dir/${pci}_ifname" ]] && continue
+    sib_ifname=$(cat "$state_file")
+    if [[ -n "$sib_ifname" ]]; then
+        sib_ns_cmd=""
+        if ip netns list 2>/dev/null | grep -q "ns_${sib_ifname}"; then
+            sib_ns_cmd="ip netns exec ns_${sib_ifname}"
+        fi
+        sib_tx_frames=$($sib_ns_cmd ethtool -c "$sib_ifname" 2>/dev/null | awk '/^tx-frames:/{print $2}')
+        if [[ "$sib_tx_frames" != "1" ]]; then
+            echo "  Dual-port fix: $sib_ifname tx-frames=$sib_tx_frames, resetting to 1"
+            $sib_ns_cmd ethtool -C "$sib_ifname" rx-frames 1 tx-frames 1
+            $sib_ns_cmd ethtool -C "$sib_ifname" adaptive-tx off adaptive-rx off rx-usecs 0 tx-usecs 0
+        fi
+    fi
+done
 set -x
 
 # ksoftirqd priority
@@ -434,8 +504,43 @@ if [[ -n "$ksoftirqd_pid" ]]; then
     set -x
 fi
 
+# --- Enable softirq inline on app and IRQ CPUs ---
+# Enables inline softirq processing (in IRQ context) instead of deferring to ksoftirqd
+# Expected impact: +2-5% throughput, -5-8 μs tail latency reduction
+# The boot parameter softirq_inline_cpus doesn't work (parsing issue), so enable manually
+{ set +x; } 2>/dev/null
+echo ""
+echo "=== Enabling softirq_inline on CPUs $cpu and $irq_cpu ==="
+for target_cpu in $cpu $irq_cpu; do
+    if [[ -f /sys/devices/system/cpu/cpu$target_cpu/softirq_inline ]]; then
+        current=$(cat /sys/devices/system/cpu/cpu$target_cpu/softirq_inline)
+        if [[ "$current" != "1" ]]; then
+            echo 1 > /sys/devices/system/cpu/cpu$target_cpu/softirq_inline
+            echo "  CPU $target_cpu: softirq_inline enabled (was $current)"
+        else
+            echo "  CPU $target_cpu: softirq_inline already enabled"
+        fi
+    else
+        echo "  CPU $target_cpu: softirq_inline interface not available"
+    fi
+done
+echo ""
+set -x
+
 # --- PCIe power management disable ---
 setpci -s "$pci" 0xd0.b=0x00
+
+# Re-apply setpci on sibling port (dual-port card: ethtool -L can reset sibling's PCIe PM)
+sibling_pci=$(lspci -D | grep "ConnectX" | grep "$pci_bus" | awk '{print $1}' | sed 's/^0000://' | grep -v "^${pci}$" | head -1)
+if [[ -n "$sibling_pci" ]] && [[ -f "$state_dir/${sibling_pci}_comp0" ]]; then
+    sibling_pm=$(setpci -s "$sibling_pci" 0xd0.b 2>/dev/null)
+    if [[ "$sibling_pm" != "00" ]]; then
+        { set +x; } 2>/dev/null
+        echo "  Dual-port fix: sibling $sibling_pci PCIe PM was 0x$sibling_pm, resetting to 0x00"
+        set -x
+        setpci -s "$sibling_pci" 0xd0.b=0x00
+    fi
+fi
 
 # --- PTP clock setup ---
 if [[ "$skip_ptp" -eq 0 && -n "$ptp_source" ]]; then
@@ -565,6 +670,53 @@ if [[ "$RX_USECS" == "0" ]]; then
 else
     echo "  ✗ WARNING: rx-usecs: $RX_USECS (expected 0)"
 fi
+
+
+# --- Tickless isolated CPUs (nohz_full) — auto-remediate if stuck ---
+# Known unresolved kernel issue: isolated CPUs occasionally get permanently stuck
+# ticking (tick_stopped=0) after a rant run. CPU hotplug/rcu_expedited don't clear
+# it; scheduling any trivial task on the stuck CPU does. Check + auto-fix here so
+# config.sh never leaves a stuck CPU behind for the next test.
+echo ""
+echo "=== Tickless Isolated CPUs (nohz_full) ==="
+for tcpu in 49 50 51 52 53 54 55; do
+    stuck=$(python3 -c "
+with open('/proc/timer_list') as f:
+    lines = f.readlines()
+cpu = None
+for l in lines:
+    l = l.rstrip()
+    if l.startswith('cpu: '):
+        cpu = int(l.split()[1])
+    if 'tick_stopped' in l and cpu == $tcpu:
+        print(l.split(':')[1].strip())
+" 2>/dev/null || echo "")
+    if [[ "$stuck" == "0" ]]; then
+        echo "  CPU $tcpu stuck ticking -- auto-remediating..."
+        for attempt in 1 2 3; do
+            taskset -c "$tcpu" sleep 0.5 2>/dev/null || true
+            sleep 1
+            recheck=$(python3 -c "
+with open('/proc/timer_list') as f:
+    lines = f.readlines()
+cpu = None
+for l in lines:
+    l = l.rstrip()
+    if l.startswith('cpu: '):
+        cpu = int(l.split()[1])
+    if 'tick_stopped' in l and cpu == $tcpu:
+        print(l.split(':')[1].strip())
+" 2>/dev/null || echo "")
+            [[ "$recheck" == "1" ]] && break
+        done
+        if [[ "$recheck" == "1" ]]; then
+            echo "  ✓ CPU $tcpu recovered to tickless"
+        else
+            echo "  ✗ WARNING: CPU $tcpu still stuck ticking after remediation attempts"
+        fi
+    fi
+done
+echo "  ✓ Isolated CPUs (49-55) checked/remediated"
 
 echo ""
 echo "=== SUCCESS ==="
