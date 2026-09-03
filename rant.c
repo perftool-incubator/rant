@@ -551,6 +551,16 @@ void emit(config_t cfg) {
     calibrate_rdtsc();
     if (verbose)
         fprintf(stderr, "✅ RDTSC: %"PRIu64" cycles/sec, anchored to TAI\n", cycles_per_sec);
+
+    /* Set up PMC counters if enabled (client) */
+    if (cfg.enable_pmc) {
+        int n = pmc_setup();
+        if (n > 0)
+            fprintf(stderr, "✅ PMC: %d counters active (rdpmc)\n", n);
+        else
+            fprintf(stderr, "Warning: No PMC counters available. Continuing without PMC.\n");
+    }
+
     uint64_t start_tsc = rdtsc();
     uint64_t test_start_tsc = start_tsc;
     uint64_t deadline = cfg.duration > 0 ? start_tsc + (cfg.duration * cycles_per_sec): 0;
@@ -565,6 +575,15 @@ void emit(config_t cfg) {
 
     /* RDTSC breakdown checkpoints for client */
     uint64_t tsc_pre_sendto, tsc_sendto, tsc_poll_tx, tsc_errqueue, tsc_pre_poll_rx, tsc_poll_rx, tsc_pre_recvmsg, tsc_recvmsg;
+
+    /* PMC checkpoints for per-phase counter deltas (client) */
+    uint64_t pmc_pre_sendto[PMC_MAX], pmc_post_sendto[PMC_MAX];
+    uint64_t pmc_pre_poll_rx[PMC_MAX], pmc_post_poll_rx[PMC_MAX];
+    uint64_t pmc_pre_recvmsg[PMC_MAX], pmc_post_recvmsg[PMC_MAX];
+
+    /* Fast-path PMC accumulators for comparison (<20us = fast) */
+    uint64_t pmc_fast_sendto_sum[PMC_MAX] = {0}, pmc_fast_poll_rx_sum[PMC_MAX] = {0}, pmc_fast_recvmsg_sum[PMC_MAX] = {0};
+    uint64_t pmc_fast_count = 0;
 
     while (keep_running) {
 
@@ -590,12 +609,14 @@ void emit(config_t cfg) {
         rtt = &warmup_record;
 
         /* T1_SW: RDTSC before sendto */
+        if (pmc_count > 0) pmc_snapshot(pmc_pre_sendto);
         rtt->sw_tx = rdtsc();
         tsc_pre_sendto = rtt->sw_tx;
 
         /* Send Ping */
         sendto(s, buf, 1, 0, (struct sockaddr*)&addr, sizeof(addr));
         tsc_sendto = rdtsc();
+        if (pmc_count > 0) pmc_snapshot(pmc_post_sendto);
 
         if (!cfg.no_hw_ts) {
             /* Wait for TX timestamp (blocks until POLLPRI or signal) */
@@ -619,15 +640,19 @@ void emit(config_t cfg) {
         /* Wait for pong (blocks until POLLIN or signal) */
         msg_rx.msg_controllen = sizeof(cbuf_rx);
         msg_rx.msg_flags = 0;
+        if (pmc_count > 0) pmc_snapshot(pmc_pre_poll_rx);
         tsc_pre_poll_rx = rdtsc();
         poll(&pfd_rx, 1, -1);
         if (!keep_running) break;
         tsc_poll_rx = rdtsc();
+        if (pmc_count > 0) pmc_snapshot(pmc_post_poll_rx);
 
         /* Receive Pong — T4_HW from cmsg, T4_SW from RDTSC */
+        if (pmc_count > 0) pmc_snapshot(pmc_pre_recvmsg);
         tsc_pre_recvmsg = rdtsc();
         recvmsg(s, &msg_rx, 0);
         tsc_recvmsg = rdtsc();
+        if (pmc_count > 0) pmc_snapshot(pmc_post_recvmsg);
         rtt->sw_rx = tsc_recvmsg;
         if (!cfg.no_hw_ts) {
             get_ts(&msg_rx, &rtt->hw_rx);
@@ -661,6 +686,16 @@ void emit(config_t cfg) {
                 log_size++;
             }
 
+            /* Accumulate fast-path PMC stats (delta < 20us) for comparison */
+            if (pmc_count > 0 && rtt->delta < 20000) {
+                for (int i = 0; i < pmc_count; i++) {
+                    pmc_fast_sendto_sum[i] += pmc_post_sendto[i] - pmc_pre_sendto[i];
+                    pmc_fast_poll_rx_sum[i] += pmc_post_poll_rx[i] - pmc_pre_poll_rx[i];
+                    pmc_fast_recvmsg_sum[i] += pmc_post_recvmsg[i] - pmc_pre_recvmsg[i];
+                }
+                pmc_fast_count++;
+            }
+
             if (cfg.threshold > 0 && rtt->delta > cfg.threshold) {
                 printf("Round-Trip latency (%"PRIu64" ns) exceeds threshold (%"PRIu64" ns).\n",
                        rtt->delta, cfg.threshold);
@@ -683,6 +718,37 @@ void emit(config_t cfg) {
                        (uint64_t)((tsc_recvmsg - tsc_pre_recvmsg) * 1000000000ULL / cycles_per_sec));
                 printf("    total:              %"PRIu64" ns\n",
                        (uint64_t)((tsc_recvmsg - tsc_pre_sendto) * 1000000000ULL / cycles_per_sec));
+
+                if (pmc_count > 0) {
+                    printf("  --- PMC: this spike ---\n");
+                    printf("    sendto() phase:\n");
+                    for (int i = 0; i < pmc_count; i++)
+                        printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
+                               pmc_post_sendto[i] - pmc_pre_sendto[i]);
+                    printf("    poll_rx (wait for response):\n");
+                    for (int i = 0; i < pmc_count; i++)
+                        printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
+                               pmc_post_poll_rx[i] - pmc_pre_poll_rx[i]);
+                    printf("    recvmsg() phase:\n");
+                    for (int i = 0; i < pmc_count; i++)
+                        printf("      %-20s: %"PRIu64"\n", pmc_counters[i].name,
+                               pmc_post_recvmsg[i] - pmc_pre_recvmsg[i]);
+                    if (pmc_fast_count > 0) {
+                        printf("  --- PMC: fast-path avg (<20us, %"PRIu64" samples) ---\n", pmc_fast_count);
+                        printf("    sendto() phase:\n");
+                        for (int i = 0; i < pmc_count; i++)
+                            printf("      %-20s: %.1f\n", pmc_counters[i].name,
+                                   (double)pmc_fast_sendto_sum[i] / pmc_fast_count);
+                        printf("    poll_rx (wait for response):\n");
+                        for (int i = 0; i < pmc_count; i++)
+                            printf("      %-20s: %.1f\n", pmc_counters[i].name,
+                                   (double)pmc_fast_poll_rx_sum[i] / pmc_fast_count);
+                        printf("    recvmsg() phase:\n");
+                        for (int i = 0; i < pmc_count; i++)
+                            printf("      %-20s: %.1f\n", pmc_counters[i].name,
+                                   (double)pmc_fast_recvmsg_sum[i] / pmc_fast_count);
+                    }
+                }
 
                 /* Write to trace_marker for kernel tracing correlation */
                 if (trace_marker_fd >= 0) {
