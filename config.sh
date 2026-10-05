@@ -24,7 +24,7 @@
 #   --no-namespace           Skip namespace setup (interface already configured)
 #   --no-ptp                 Skip PTP sync setup
 #   --irq-prio <n>           IRQ thread FIFO priority (default: 50)
-#   --ksoftirqd-prio <n>     ksoftirqd FIFO priority (default: 11)
+#   --ksoftirqd-prio <n>     ksoftirqd FIFO priority on IRQ core (default: 50)
 #   -h, --help               Show this help
 #
 # Dual-port cards: configure BOTH ports before testing. The script saves IRQ
@@ -53,7 +53,7 @@ ptp_sync_to=""
 skip_namespace=0
 skip_ptp=0
 irq_prio=50
-ksoftirqd_prio=11
+ksoftirqd_prio=50
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -127,8 +127,38 @@ for svc in fwupd.service fwupd-refresh.service fwupd-refresh.timer fwupd-offline
 done
 echo "  Masked periodic/background noise sources: fwupd (+refresh/offline-update), crond, mcelog, smartd, rhsmcertd"
 
+# --- Stop periodic timers during the measurement window ---
+# Runtime-only: stop timers before tests, but do not disable, mask, or change
+# their boot-time enablement.  Re-enable them after the campaign completes.
+for timer in logrotate.timer raid-check.timer fstrim.timer systemd-tmpfiles-clean.timer; do
+    systemctl stop "$timer" 2>/dev/null || true
+done
+echo "  Stopped measurement-window timers: logrotate, raid-check, fstrim, systemd-tmpfiles-clean"
+
+# --- CPU energy-performance preference ---
+# Use the kernel sysfs control directly.  energy_perf_bias=0 is the
+# performance preference for intel_cpufreq.  Do not use x86_energy_perf:
+# on this host it attempts to write unsupported MSR 0x774 and taints the
+# kernel with CPU_OUT_OF_SPEC.
+energy_bias_count=0
+for energy_bias in /sys/devices/system/cpu/cpu*/power/energy_perf_bias; do
+    [[ -e "$energy_bias" ]] || continue
+    echo 0 > "$energy_bias"
+    energy_bias_count=$((energy_bias_count + 1))
+done
+echo "  CPU energy preference: performance (energy_perf_bias=0, CPUs=$energy_bias_count)"
+
 # --- Unmanage test interface from NetworkManager ---
 if command -v nmcli &>/dev/null && nmcli device status &>/dev/null 2>&1; then
+    # Keep only the SSH/public management NIC managed.  The policy file is
+    # shipped next to this script and is also installed by the baseline setup.
+    nm_policy_src="$(dirname "$0")/99-latency-unmanaged.conf"
+    nm_policy_dst="/etc/NetworkManager/conf.d/99-latency-unmanaged.conf"
+    if [[ -f "$nm_policy_src" ]]; then
+        install -D -m 0644 "$nm_policy_src" "$nm_policy_dst"
+        nmcli general reload conf 2>/dev/null || true
+        echo "  NetworkManager: installed latency unmanaged-device policy"
+    fi
     if nmcli device status 2>/dev/null | grep -q "^${ifname}[[:space:]]"; then
         nmcli device set "$ifname" managed no 2>/dev/null || true
         echo "=== NetworkManager: ${ifname} set to unmanaged ==="
@@ -220,6 +250,8 @@ sysctl -w net.core.netdev_budget_usecs=2000
 sysctl -w net.ipv4.tcp_low_latency=1
 sysctl -w net.ipv4.tcp_autocorking=0
 sysctl -w net.core.default_qdisc=noqueue
+# Prevent bulk PCP page draining stalls under global zone->lock
+sysctl -w vm.percpu_pagelist_high_fraction=0x7fffffff
 
 # --- Namespace setup ---
 ns_cmd="ip netns exec ns_${ifname}"
@@ -239,6 +271,8 @@ fi
 # --- Ethtool tuning ---
 
 # Queue and offload settings (driver-independent)
+# Enforce the supported low-latency ring size on both test ports.
+$ns_cmd ethtool -G "$ifname" rx 128 tx 128
 # Skip ethtool -L if already combined 1 — on dual-port cards, ethtool -L on one
 # port resets IRQ thread affinities for BOTH ports, undoing previous pinning.
 current_combined=$($ns_cmd ethtool -l "$ifname" 2>/dev/null | awk '/^Combined:/{val=$2} END{print val}')
@@ -254,9 +288,10 @@ $ns_cmd ethtool -K "$ifname" lro off gro off
 $ns_cmd ethtool -K "$ifname" tso off gso off
 $ns_cmd ethtool -C "$ifname" rx-frames 1 tx-frames 1
 $ns_cmd ethtool -C "$ifname" adaptive-tx off adaptive-rx off rx-usecs 0 tx-usecs 0
-$ns_cmd ethtool -G "$ifname" rx 64 tx 128
-$ns_cmd ethtool -g "$ifname"
 $ns_cmd ethtool -A "$ifname" rx off tx off
+
+# Auto-negotiation: mandatory on copper (CR) links for IEEE 802.3cd Clause 73/136 link training
+$ns_cmd ethtool -s "$ifname" autoneg on 2>/dev/null || true
 
 # Driver-specific private flags
 case "$driver" in
@@ -279,9 +314,9 @@ case "$driver" in
         ;;
 esac
 
-# NAPI defer and GRO flush
-$ns_cmd bash -c "echo 0 > /sys/class/net/$ifname/napi_defer_hard_irqs"
-$ns_cmd bash -c "echo 0 > /sys/class/net/$ifname/gro_flush_timeout"
+# NAPI defer and GRO flush (optimal low latency busy poll settings)
+$ns_cmd bash -c "echo 30 > /sys/class/net/$ifname/napi_defer_hard_irqs"
+$ns_cmd bash -c "echo 30000 > /sys/class/net/$ifname/gro_flush_timeout"
 
 # --- Interface and IP setup ---
 $ns_cmd ip link set lo up
@@ -494,33 +529,44 @@ for state_file in "$state_dir/${pci_bus}."*_ifname; do
 done
 set -x
 
-# ksoftirqd priority
-ksoftirqd_pid=$(pgrep -x "ksoftirqd/$irq_cpu")
-if [[ -n "$ksoftirqd_pid" ]]; then
-    chrt -f -p "$ksoftirqd_prio" "$ksoftirqd_pid"
+# ksoftirqd priority on IRQ core (matches mlx5_comp0 at FIFO:50 to eliminate preemption thrashing)
+ksoftirqd_irq_pid=$(pgrep -x "ksoftirqd/$irq_cpu")
+if [[ -n "$ksoftirqd_irq_pid" ]]; then
+    chrt -f -p "$ksoftirqd_prio" "$ksoftirqd_irq_pid"
     { set +x; } 2>/dev/null
     echo ""
     echo "=== ksoftirqd/$irq_cpu ==="
-    echo "  Priority: $(chrt -p $ksoftirqd_pid)"
+    echo "  Priority: $(chrt -p $ksoftirqd_irq_pid)"
     echo ""
     set -x
 fi
 
-# --- Enable softirq inline on app and IRQ CPUs ---
-# Enables inline softirq processing (in IRQ context) instead of deferring to ksoftirqd
-# Expected impact: +2-5% throughput, -5-8 μs tail latency reduction
-# The boot parameter softirq_inline_cpus doesn't work (parsing issue), so enable manually
+# ksoftirqd priority on app core (FIFO:11 subordinate to rant at FIFO:60, prevents CFS starvation)
+ksoftirqd_app_pid=$(pgrep -x "ksoftirqd/$cpu")
+if [[ -n "$ksoftirqd_app_pid" ]]; then
+    chrt -f -p 11 "$ksoftirqd_app_pid"
+    { set +x; } 2>/dev/null
+    echo ""
+    echo "=== ksoftirqd/$cpu ==="
+    echo "  Priority: $(chrt -p $ksoftirqd_app_pid)"
+    echo ""
+    set -x
+fi
+
+# --- Disable softirq inline on app and IRQ CPUs ---
+# Defer softirq processing to ksoftirqd instead of processing it in IRQ context.
+# This is an A/B configuration against the previously tested softirq_inline=1.
 { set +x; } 2>/dev/null
 echo ""
-echo "=== Enabling softirq_inline on CPUs $cpu and $irq_cpu ==="
+echo "=== Disabling softirq_inline on CPUs $cpu and $irq_cpu ==="
 for target_cpu in $cpu $irq_cpu; do
     if [[ -f /sys/devices/system/cpu/cpu$target_cpu/softirq_inline ]]; then
         current=$(cat /sys/devices/system/cpu/cpu$target_cpu/softirq_inline)
-        if [[ "$current" != "1" ]]; then
-            echo 1 > /sys/devices/system/cpu/cpu$target_cpu/softirq_inline
-            echo "  CPU $target_cpu: softirq_inline enabled (was $current)"
+        if [[ "$current" != "0" ]]; then
+            echo 0 > /sys/devices/system/cpu/cpu$target_cpu/softirq_inline
+            echo "  CPU $target_cpu: softirq_inline disabled (was $current)"
         else
-            echo "  CPU $target_cpu: softirq_inline already enabled"
+            echo "  CPU $target_cpu: softirq_inline already disabled"
         fi
     else
         echo "  CPU $target_cpu: softirq_inline interface not available"
@@ -730,4 +776,10 @@ echo "  IP: ${ip_addr}/24, Remote: ${remote_ip}"
 echo "  App CPU: $cpu, IRQ CPU: $irq_cpu"
 echo "  NVMe/mpi3mr: Verified demoted on test CPUs"
 echo "  rx-frames: $RX_FRAMES, rx-usecs: $RX_USECS"
+echo ""
+
+# Link training stabilization wait
+echo "Waiting 10 seconds for IEEE 802.3cd Link Training, RS-FEC alignment, and SerDes equalization to stabilize..."
+sleep 10
+echo "  ✓ Physical link stabilized. Ready for testing."
 echo ""

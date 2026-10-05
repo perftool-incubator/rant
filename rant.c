@@ -23,6 +23,7 @@
 #include <sys/syscall.h>
 #include <pthread.h>
 #include <sched.h>
+#include <limits.h>
 
 #ifndef SO_PREFER_BUSY_POLL
 #define SO_PREFER_BUSY_POLL 69
@@ -50,6 +51,8 @@ typedef struct {
     uint64_t warmup;
     int busy_poll_us;
     int busy_poll_budget;
+    int response_timeout_ms;
+    unsigned long missed_threshold;
     int prefer_busy_poll;
     int use_hugepages;
     int enable_trace_marker;
@@ -104,7 +107,51 @@ int snapshot_fd = -1;
 uint64_t negative_delta_count = 0;
 
 void handle_sig(int sig) {
+    (void)sig;
     keep_running = 0;
+}
+
+static inline uint64_t rdtsc(void);
+static inline int duration_elapsed_monotonic(void);
+
+static void install_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sig;
+    sigemptyset(&sa.sa_mask);
+    /* Do not restart poll(): Ctrl-C must wake the client immediately. */
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+
+/*
+ * A literal poll(..., -1) can remain stuck in the RT/NIC busy-poll path if
+ * the expected response never arrives. Preserve infinite-wait semantics at
+ * the RANT level, but use short interruptible slices so signals and the test
+ * deadline are observed even when no packet arrives.
+ */
+#define INFINITE_POLL_SLICE_MS 1
+#define POLL_DURATION_EXPIRED (-2)
+
+static int poll_interruptible(struct pollfd *pfd, nfds_t nfds,
+                              int timeout_ms, uint64_t deadline) {
+    if (timeout_ms >= 0)
+        return poll(pfd, nfds, timeout_ms);
+
+    for (;;) {
+        if (!keep_running) {
+            errno = EINTR;
+            return -1;
+        }
+        if (deadline > 0 && rdtsc() > deadline &&
+            duration_elapsed_monotonic())
+            return POLL_DURATION_EXPIRED;
+
+        int rc = poll(pfd, nfds, INFINITE_POLL_SLICE_MS);
+        if (rc != 0)
+            return rc;
+    }
 }
 
 void get_ts(struct msghdr *msg, struct timespec *hw_ts) {
@@ -313,10 +360,14 @@ static int open_tracefs(const char *filename, int flags) {
     char path[256];
     int fd;
 
-    /* Try instance path first (works even if global buffer is corrupted) */
-    snprintf(path, sizeof(path), "/sys/kernel/tracing/instances/rant/%s", filename);
-    fd = open(path, flags);
-    if (fd >= 0) return fd;
+    int use_global = (getenv("RANT_GLOBAL_TRACEFS") != NULL);
+
+    if (!use_global) {
+        /* Try instance path first (works even if global buffer is corrupted) */
+        snprintf(path, sizeof(path), "/sys/kernel/tracing/instances/rant/%s", filename);
+        fd = open(path, flags);
+        if (fd >= 0) return fd;
+    }
 
     /* Try global tracefs */
     snprintf(path, sizeof(path), "/sys/kernel/tracing/%s", filename);
@@ -331,8 +382,10 @@ static int open_tracefs(const char *filename, int flags) {
 
 /* Open trace_marker and tracing_on for kernel tracing integration */
 void open_trace_marker() {
-    /* Create rant trace instance if it doesn't exist */
-    mkdir("/sys/kernel/tracing/instances/rant", 0755);
+    /* Create rant trace instance if it doesn't exist and not using global tracefs */
+    if (!getenv("RANT_GLOBAL_TRACEFS")) {
+        mkdir("/sys/kernel/tracing/instances/rant", 0755);
+    }
 
     trace_marker_fd = open_tracefs("trace_marker", O_WRONLY);
     if (trace_marker_fd < 0) {
@@ -565,6 +618,8 @@ void emit(config_t cfg) {
     uint64_t test_start_tsc = start_tsc;
     uint64_t deadline = cfg.duration > 0 ? start_tsc + (cfg.duration * cycles_per_sec): 0;
     uint64_t packet_count = 0;
+    uint64_t missed_responses = 0;
+    int test_started = 0;
     struct record warmup_record;  /* Temporary storage for warmup packets */
     struct record *rtt;
 
@@ -585,13 +640,19 @@ void emit(config_t cfg) {
     uint64_t pmc_fast_sendto_sum[PMC_MAX] = {0}, pmc_fast_poll_rx_sum[PMC_MAX] = {0}, pmc_fast_recvmsg_sum[PMC_MAX] = {0};
     uint64_t pmc_fast_count = 0;
 
+    /* Ensure finite response timeouts can never leave duration tracking
+     * uninitialized while waiting for the first successful packet. */
+    clock_gettime(CLOCK_MONOTONIC, &monotonic_start);
+    duration_sec = cfg.duration;
+
     while (keep_running) {
 
         /* Start timing when warmup completes, before first test packet */
-        if (packet_count == cfg.warmup) {
+        if (!test_started && packet_count >= cfg.warmup) {
             test_start_tsc = rdtsc();
             clock_gettime(CLOCK_MONOTONIC, &monotonic_start);
             duration_sec = cfg.duration;
+            test_started = 1;
             if (trace_marker_fd >= 0) {
                 char marker[128];
                 struct timespec now;
@@ -622,7 +683,31 @@ void emit(config_t cfg) {
             /* Wait for TX timestamp (blocks until POLLPRI or signal) */
             msg_tx.msg_controllen = sizeof(cbuf_tx);
             msg_tx.msg_flags = 0;
-            poll(&pfd_tx, 1, -1);
+            int poll_tx_rc = poll_interruptible(&pfd_tx, 1,
+                                                cfg.response_timeout_ms,
+                                                deadline);
+            if (poll_tx_rc == POLL_DURATION_EXPIRED)
+                break;
+            if (poll_tx_rc == 0) {
+                missed_responses++;
+                fprintf(stderr, "Response timeout waiting for TX timestamp (missed=%"PRIu64")\n",
+                        missed_responses);
+                if (cfg.missed_threshold > 0 &&
+                    missed_responses >= cfg.missed_threshold) {
+                    fprintf(stderr, "Missed-response threshold reached (%"PRIu64")\n",
+                            cfg.missed_threshold);
+                    break;
+                }
+                if (cfg.duration > 0 && rdtsc() > deadline && duration_elapsed_monotonic())
+                    break;
+                continue;
+            }
+            if (poll_tx_rc < 0) {
+                if (errno == EINTR && keep_running)
+                    continue;
+                perror("poll TX timestamp");
+                break;
+            }
             if (!keep_running) break;
             tsc_poll_tx = rdtsc();
 
@@ -642,7 +727,31 @@ void emit(config_t cfg) {
         msg_rx.msg_flags = 0;
         if (pmc_count > 0) pmc_snapshot(pmc_pre_poll_rx);
         tsc_pre_poll_rx = rdtsc();
-        poll(&pfd_rx, 1, -1);
+        int poll_rx_rc = poll_interruptible(&pfd_rx, 1,
+                                            cfg.response_timeout_ms,
+                                            deadline);
+        if (poll_rx_rc == POLL_DURATION_EXPIRED)
+            break;
+        if (poll_rx_rc == 0) {
+            missed_responses++;
+            fprintf(stderr, "Response timeout waiting for pong (missed=%"PRIu64")\n",
+                    missed_responses);
+            if (cfg.missed_threshold > 0 &&
+                missed_responses >= cfg.missed_threshold) {
+                fprintf(stderr, "Missed-response threshold reached (%"PRIu64")\n",
+                        cfg.missed_threshold);
+                break;
+            }
+            if (cfg.duration > 0 && rdtsc() > deadline && duration_elapsed_monotonic())
+                break;
+            continue;
+        }
+        if (poll_rx_rc < 0) {
+            if (errno == EINTR && keep_running)
+                continue;
+            perror("poll response");
+            break;
+        }
         if (!keep_running) break;
         tsc_poll_rx = rdtsc();
         if (pmc_count > 0) pmc_snapshot(pmc_post_poll_rx);
@@ -780,6 +889,7 @@ void emit(config_t cfg) {
     double wall_duration = (monotonic_end.tv_sec - monotonic_start.tv_sec) +
                            (monotonic_end.tv_nsec - monotonic_start.tv_nsec) / 1e9;
     printf("Test is complete. Duration: %.2f s\n", wall_duration);
+    printf("Missed packet responses: %"PRIu64"\n", missed_responses);
 }
 
 /* Reflect: send back round trip pkt (server) */
@@ -1239,6 +1349,8 @@ void print_usage(const char *progname) {
     printf("  -G, --hugepages               Use hugepages for memory allocation (requires system config)\n");
     printf("  -p, --busy-poll-us <us>       Set SO_BUSY_POLL per-socket timeout (microseconds)\n");
     printf("  -B, --budget <budget>         Set SO_BUSY_POLL_BUDGET (NAPI poll budget)\n");
+    printf("      --response-timeout-ms <ms> Response poll timeout (default: 1; -1 = infinite)\n");
+    printf("      --missed-threshold <n>    Stop when missed responses reach n (min: 1)\n");
     printf("  -P, --prefer-busypoll         Set SO_PREFER_BUSY_POLL (prefer busy poll over interrupt)\n");
     printf("  -v, --verbose                 Verbose output (show config, allocation, progress)\n");
     printf("  -M, --pmc                     Enable hardware performance counter (rdpmc) instrumentation\n");
@@ -1635,6 +1747,8 @@ int main(int argc, char **argv) {
 	.duration =0,
 	.warmup = 0,
 	.busy_poll_budget = 0,
+	.response_timeout_ms = 1,
+	.missed_threshold = 0,
 	.prefer_busy_poll = 0,
 	.use_hugepages = 0,
 	.enable_trace_marker = 0,
@@ -1647,8 +1761,7 @@ int main(int argc, char **argv) {
     
     bucket_max = DEFAULT_BUCKET_MAX;
 
-    signal(SIGINT, handle_sig);
-    signal(SIGTERM, handle_sig);
+    install_signal_handlers();
 
     static struct option long_options[] = {
         {"duration",         required_argument, 0, 'd'},
@@ -1674,6 +1787,8 @@ int main(int argc, char **argv) {
         {"fast-path",        no_argument,       0, 'F'},
         {"threaded",         no_argument,       0, '2'},
         {"busy-poll-us",     required_argument, 0, 'p'},
+        {"response-timeout-ms", required_argument, 0, 1000},
+        {"missed-threshold", required_argument, 0, 1001},
         {"help",             no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -1798,6 +1913,30 @@ int main(int argc, char **argv) {
 	    case 'p':  // --busy-poll-us
 		config.busy_poll_us = atoi(optarg);
 		break;
+	    case 1000: { /* --response-timeout-ms */
+		char *end = NULL;
+		errno = 0;
+		long value = strtol(optarg, &end, 10);
+		if (*optarg == '\0' || *end != '\0' || errno == ERANGE ||
+		    value < -1 || value > INT_MAX) {
+		    fprintf(stderr, "Error: response timeout must be -1 or an integer from 0 to %d ms.\n", INT_MAX);
+		    return 1;
+		}
+		config.response_timeout_ms = (int)value;
+		break;
+	    }
+	    case 1001: { /* --missed-threshold */
+		char *end = NULL;
+		errno = 0;
+		unsigned long value = strtoul(optarg, &end, 10);
+                if (*optarg == '\0' || *end != '\0' || errno == ERANGE ||
+                    value < 1 || value >= (unsigned long)LONG_MAX) {
+                    fprintf(stderr, "Error: missed threshold must be an integer from 1 to less than %ld.\n", LONG_MAX);
+		    return 1;
+		}
+		config.missed_threshold = value;
+		break;
+	    }
 	    case 'h':
 		print_usage(argv[0]);
 		return 0;
@@ -1833,6 +1972,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, ")");
         fprintf(stderr, "\n");
         fprintf(stderr, "  Warmup:         %"PRIu64" packets\n", config.warmup);
+        fprintf(stderr, "  Response timeout: %d ms%s\n", config.response_timeout_ms,
+                config.response_timeout_ms == -1 ? " (infinite)" : "");
+        if (config.missed_threshold > 0)
+            fprintf(stderr, "  Missed threshold: %lu\n", config.missed_threshold);
         if (config.threshold > 0)
             fprintf(stderr, "  Threshold:      %"PRIu64" us (%s)\n", config.threshold / 1000,
                 config.threshold_continue ? "continue" : "stop on breach");
@@ -2100,5 +2243,3 @@ int main(int argc, char **argv) {
 
     return 0;
 }
-
-
