@@ -689,6 +689,7 @@ void emit(config_t cfg) {
             if (poll_tx_rc == POLL_DURATION_EXPIRED)
                 break;
             if (poll_tx_rc == 0) {
+                if (!test_started) continue;
                 missed_responses++;
                 fprintf(stderr, "Response timeout waiting for TX timestamp (missed=%"PRIu64")\n",
                         missed_responses);
@@ -733,6 +734,7 @@ void emit(config_t cfg) {
         if (poll_rx_rc == POLL_DURATION_EXPIRED)
             break;
         if (poll_rx_rc == 0) {
+            if (!test_started) continue;
             missed_responses++;
             fprintf(stderr, "Response timeout waiting for pong (missed=%"PRIu64")\n",
                     missed_responses);
